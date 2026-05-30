@@ -18,6 +18,7 @@ import { exportBookmarksForSyncSeed, updateQuotedTweets, updateBookmarkText, upd
 import type { ArticleUpdate } from './bookmarks-db.js';
 import { fetchArticle, resolveTcoLink } from './bookmark-enrich.js';
 import type { ArticleContent } from './bookmark-enrich.js';
+import { controlledFetch, isHttpSafetyStop } from './http-safety.js';
 import {
   compareThreadTweetsChronologically,
   expandVisibleUrlEntities,
@@ -523,7 +524,12 @@ async function fetchPageWithRetry(csrfToken: string, cursor?: string, cookieHead
   let lastError: Error | undefined;
 
   for (let attempt = 0; attempt < 4; attempt++) {
-    const response = await fetch(buildUrl(cursor, pageSize), { headers: buildHeaders(csrfToken, cookieHeader) });
+    const response = await controlledFetch(buildUrl(cursor, pageSize), { headers: buildHeaders(csrfToken, cookieHeader) }, {
+      operation: BOOKMARKS_OPERATION,
+      category: 'x-graphql',
+      attempt: attempt + 1,
+      cursorPresent: Boolean(cursor),
+    });
 
     if (response.status === 429) {
       const retryAfterSec = parseRetryAfterSec(response);
@@ -737,6 +743,10 @@ export async function syncBookmarksGraphQL(
       if (error instanceof RateLimitError) {
         stopReason = 'rate limited';
         retryAfterSec = error.retryAfterSec;
+        return undefined;
+      }
+      if (isHttpSafetyStop(error)) {
+        stopReason = error.stopReason;
         return undefined;
       }
       throw error;
@@ -981,9 +991,36 @@ export async function fetchBookmarkFolders(
   let cursor: string | undefined;
 
   for (let page = 0; page < 100; page++) {
-    const response = await fetch(buildFoldersListUrl(cursor), {
-      headers: buildHeaders(csrfToken, cookieHeader),
-    });
+    let response: Response | undefined;
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      response = await controlledFetch(buildFoldersListUrl(cursor), {
+        headers: buildHeaders(csrfToken, cookieHeader),
+      }, {
+        operation: BOOKMARK_FOLDERS_OPERATION,
+        category: 'x-graphql',
+        attempt: attempt + 1,
+        cursorPresent: Boolean(cursor),
+      });
+
+      if (response.status === 429) {
+        const retryAfterSec = parseRetryAfterSec(response);
+        const waitSec = retryAfterSec ?? Math.min(15 * Math.pow(2, attempt), 120);
+        lastError = new RateLimitError(`Rate limited (429) on attempt ${attempt + 1}`, retryAfterSec);
+        await new Promise((r) => setTimeout(r, waitSec * 1000));
+        continue;
+      }
+
+      if (response.status >= 500) {
+        lastError = new Error(`Server error (${response.status}) on attempt ${attempt + 1}`);
+        await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
+        continue;
+      }
+
+      break;
+    }
+
+    if (!response) throw lastError ?? new Error('BookmarkFoldersSlice: all retry attempts failed.');
 
     if (!response.ok) {
       const text = await response.text();
@@ -1069,13 +1106,20 @@ async function fetchFolderPage(
   let lastError: Error | undefined;
 
   for (let attempt = 0; attempt < 4; attempt++) {
-    const response = await fetch(buildFolderTimelineUrl(folderId, cursor, pageSize), {
+    const response = await controlledFetch(buildFolderTimelineUrl(folderId, cursor, pageSize), {
       headers: buildHeaders(csrfToken, cookieHeader),
+    }, {
+      operation: BOOKMARK_FOLDER_TIMELINE_OPERATION,
+      category: 'x-graphql',
+      attempt: attempt + 1,
+      cursorPresent: Boolean(cursor),
+      folderId,
     });
 
     if (response.status === 429) {
-      const waitSec = Math.min(15 * Math.pow(2, attempt), 120);
-      lastError = new Error(`Rate limited (429) on attempt ${attempt + 1}`);
+      const retryAfterSec = parseRetryAfterSec(response);
+      const waitSec = retryAfterSec ?? Math.min(15 * Math.pow(2, attempt), 120);
+      lastError = new RateLimitError(`Rate limited (429) on attempt ${attempt + 1}`, retryAfterSec);
       await new Promise((r) => setTimeout(r, waitSec * 1000));
       continue;
     }
@@ -1415,6 +1459,7 @@ export async function syncBookmarkFolders(
     try {
       walkResult = await walkFolderTimeline(csrfToken, folder.id, { cookieHeader, delayMs });
     } catch (err) {
+      if (isHttpSafetyStop(err)) throw err;
       const reason = (err as Error).message ?? 'unknown error';
       skippedFolders.push({ folder, reason });
       perFolder.push({ folder, stats: null, skipped: reason });
@@ -1799,10 +1844,16 @@ export async function fetchTweetByIdViaGraphQL(
   for (let attempt = 0; attempt < 4; attempt++) {
     let response: Response;
     try {
-      response = await fetch(buildTweetResultByRestIdUrl(tweetId), {
+      response = await controlledFetch(buildTweetResultByRestIdUrl(tweetId), {
         headers: buildHeaders(csrfToken, cookieHeader),
+      }, {
+        operation: TWEET_RESULT_BY_REST_ID_OPERATION,
+        category: 'x-graphql',
+        attempt: attempt + 1,
+        tweetId,
       });
-    } catch {
+    } catch (error) {
+      if (isHttpSafetyStop(error)) throw error;
       await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
       continue;
     }
@@ -1865,10 +1916,16 @@ export async function fetchTweetDetailViaGraphQL(
   for (let page = 0; page < maxPages; page++) {
     let response: Response;
     try {
-      response = await fetch(buildTweetDetailUrl(tweetId, cursor), {
+      response = await controlledFetch(buildTweetDetailUrl(tweetId, cursor), {
         headers: buildHeaders(csrfToken, cookieHeader),
+      }, {
+        operation: TWEET_DETAIL_OPERATION,
+        category: 'x-graphql',
+        cursorPresent: Boolean(cursor),
+        tweetId,
       });
-    } catch {
+    } catch (error) {
+      if (isHttpSafetyStop(error)) throw error;
       return { tweets, status: 'error' };
     }
 
@@ -1933,10 +1990,15 @@ async function fetchSyndicationThreadTweet(
   tweetId: string,
 ): Promise<{ tweet: ThreadTweetSnapshot | null; status: TweetFetchResult['status']; httpStatus?: number }> {
   for (let attempt = 0; attempt < 4; attempt++) {
-    const response = await fetch(`${SYNDICATION_URL}?id=${tweetId}&token=x`, {
+    const response = await controlledFetch(`${SYNDICATION_URL}?id=${tweetId}&token=x`, {
       headers: {
         'user-agent': CHROME_UA,
       },
+    }, {
+      operation: 'SyndicationTweet',
+      category: 'x-syndication',
+      attempt: attempt + 1,
+      tweetId,
     });
 
     if (response.ok) {
@@ -2068,10 +2130,16 @@ async function fetchThreadTweetById(
     for (let attempt = 0; attempt < 4; attempt++) {
       let response: Response;
       try {
-        response = await fetch(buildTweetResultByRestIdUrl(tweetId), {
+        response = await controlledFetch(buildTweetResultByRestIdUrl(tweetId), {
           headers: buildHeaders(cookies.csrfToken, cookies.cookieHeader),
+        }, {
+          operation: TWEET_RESULT_BY_REST_ID_OPERATION,
+          category: 'x-graphql',
+          attempt: attempt + 1,
+          tweetId,
         });
-      } catch {
+      } catch (error) {
+        if (isHttpSafetyStop(error)) throw error;
         await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
         continue;
       }
@@ -2458,6 +2526,21 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   const dbQuotedUpdates: Array<{ id: string; quotedTweet: QuotedTweetSnapshot }> = [];
   const dbTextUpdates: Array<{ id: string; text: string; links?: string[] }> = [];
   const articleDbUpdates: ArticleUpdate[] = [];
+  const persistGapProgress = async (): Promise<void> => {
+    await writeJsonLines(cachePath, records);
+    if (dbQuotedUpdates.length > 0) {
+      await updateQuotedTweets(dbQuotedUpdates);
+      dbQuotedUpdates.length = 0;
+    }
+    if (dbTextUpdates.length > 0) {
+      await updateBookmarkText(dbTextUpdates);
+      dbTextUpdates.length = 0;
+    }
+    if (articleDbUpdates.length > 0) {
+      await updateArticleContent(articleDbUpdates);
+      articleDbUpdates.length = 0;
+    }
+  };
 
   // Fetch and apply incrementally
   for (let i = 0; i < allFetchIds.length; i++) {
@@ -2482,6 +2565,10 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
         });
       }
     } catch (err) {
+      if (isHttpSafetyStop(err)) {
+        await persistGapProgress();
+        throw err;
+      }
       failed++;
       failures.push({
         tweetId,
@@ -2558,7 +2645,7 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
 
     // Checkpoint every 100 fetches
     if ((i + 1) % 100 === 0) {
-      await writeJsonLines(cachePath, records);
+      await persistGapProgress();
     }
 
     if (i < allFetchIds.length - 1) {
@@ -2570,9 +2657,7 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   const bookmarkedAtMissing = records.filter((r) => !r.bookmarkedAt).length;
 
   // Final persist (gaps 1+2)
-  await writeJsonLines(cachePath, records);
-  if (dbQuotedUpdates.length > 0) await updateQuotedTweets(dbQuotedUpdates);
-  if (dbTextUpdates.length > 0) await updateBookmarkText(dbTextUpdates);
+  await persistGapProgress();
 
   // ── Gap 3b: Article enrichment for ordinary link-only bookmarks ─────────
   // Bookmarks with < 80 chars of text after stripping URLs are "link-only"
@@ -2619,7 +2704,7 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
     }
   }
 
-  if (articleDbUpdates.length > 0) await updateArticleContent(articleDbUpdates);
+  await persistGapProgress();
 
   return {
     quotedTweetsFilled: quotedFetched,

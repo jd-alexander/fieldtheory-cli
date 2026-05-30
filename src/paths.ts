@@ -104,6 +104,15 @@ export function bookmarkMediaManifestPath(): string {
   return path.join(dataDir(), 'media-manifest.json');
 }
 
+export function httpAuditLogDir(): string {
+  return path.join(dataDir(), 'logs');
+}
+
+export function httpAuditLogPath(date = new Date()): string {
+  const stamp = date.toISOString().slice(0, 10);
+  return path.join(httpAuditLogDir(), `http-audit-${stamp}.jsonl`);
+}
+
 export function twitterBookmarksIndexPath(): string {
   return path.join(dataDir(), 'bookmarks.db');
 }

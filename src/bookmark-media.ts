@@ -4,6 +4,7 @@ import { writeFile } from 'node:fs/promises';
 import { ensureDir, pathExists, readJson, readJsonLines, writeJson } from './fs.js';
 import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksCachePath } from './paths.js';
 import type { BookmarkMediaObject, BookmarkRecord, ThreadTweetSnapshot } from './types.js';
+import { controlledFetch, isHttpSafetyStop } from './http-safety.js';
 
 export const DEFAULT_MEDIA_MAX_BYTES = 200 * 1024 * 1024;
 export const MEDIA_QUALITY_VALUES = ['medium', 'large', '4096x4096', 'orig'] as const;
@@ -31,6 +32,7 @@ export interface MediaFetchManifest {
   limit: number;
   maxBytes: number;
   mediaQuality?: MediaQuality;
+  stopReason?: string;
   processed: number;
   downloaded: number;
   skippedTooLarge: number;
@@ -366,6 +368,7 @@ export async function fetchBookmarkMediaBatch(
   let skippedTooLarge = 0;
   let failed = 0;
   let processed = 0;
+  let stopReason: string | undefined;
 
   const emitProgress = (currentSourceUrl?: string) => {
     options.onProgress?.({
@@ -418,6 +421,7 @@ export async function fetchBookmarkMediaBatch(
 
   emitProgress();
 
+  outer:
   for (const bookmark of candidates) {
     if (options.signal?.aborted) break;
     const mediaTargets = resolveMediaTargets(bookmark, coveredProfileImageUrls, skipProfileImages, mediaQuality);
@@ -436,7 +440,11 @@ export async function fetchBookmarkMediaBatch(
       const fetchedAt = new Date().toISOString();
 
       try {
-        const head = await fetch(sourceUrl, { method: 'HEAD' });
+        const head = await controlledFetch(sourceUrl, { method: 'HEAD' }, {
+          operation: 'BookmarkMediaHead',
+          category: 'media',
+          tweetId,
+        });
         const contentLengthHeader = head.headers.get('content-length');
         const contentType = head.headers.get('content-type') ?? undefined;
         const declaredBytes = contentLengthHeader ? Number(contentLengthHeader) : undefined;
@@ -471,7 +479,11 @@ export async function fetchBookmarkMediaBatch(
           continue;
         }
 
-        const response = await fetch(sourceUrl);
+        const response = await controlledFetch(sourceUrl, undefined, {
+          operation: 'BookmarkMediaGet',
+          category: 'media',
+          tweetId,
+        });
         if (!response.ok) {
           const entry = {
             bookmarkId,
@@ -562,6 +574,10 @@ export async function fetchBookmarkMediaBatch(
         processed += 1;
         emitProgress(sourceUrl);
       } catch (error) {
+        if (isHttpSafetyStop(error)) {
+          stopReason = error.stopReason;
+          break outer;
+        }
         const entry = {
           bookmarkId,
           tweetId,
@@ -593,6 +609,7 @@ export async function fetchBookmarkMediaBatch(
     limit: manifestLimit,
     maxBytes,
     mediaQuality,
+    stopReason,
     processed,
     downloaded,
     skippedTooLarge,

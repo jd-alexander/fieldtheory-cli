@@ -35,6 +35,7 @@ import { renderViz } from './bookmarks-viz.js';
 import { listBrowserIds } from './browsers.js';
 import { configureHttpProxyFromEnv } from './http-proxy.js';
 import { dataDir, ensureDataDir, isFirstRun, migrateLegacyIdeasData, twitterBookmarksIndexPath, twitterBackfillStatePath, mdDir, bookmarkMediaDir, bookmarkMediaManifestPath } from './paths.js';
+import { configureHttpSafety, httpSafetyAuditPath } from './http-safety.js';
 import { PromptCancelledError, promptText } from './prompt.js';
 import { skillWithFrontmatter, installSkill, uninstallSkill } from './skill.js';
 import { registerCompanionCommands } from './companion-cli.js';
@@ -211,6 +212,9 @@ const FRIENDLY_STOP_REASONS: Record<string, string> = {
   'max runtime reached': 'Paused after 30 minutes. Run again to continue.',
   'max pages reached': 'Paused after reaching page limit. Run again to continue.',
   'rate limited': 'Paused by X rate limiting.',
+  'request budget reached': 'Paused after reaching the configured HTTP request budget.',
+  'hourly request budget reached': 'Paused after reaching the configured hourly HTTP request budget.',
+  'rate limit floor reached': 'Paused before draining the remaining X rate-limit budget.',
   'target additions reached': 'Reached target bookmark count.',
   'interrupted': 'Interrupted by user.',
 };
@@ -233,6 +237,61 @@ function formatRetryAfter(seconds?: number): string | undefined {
   return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
 }
 
+const DEFAULT_TIMELINE_DELAY_MS = 2000;
+const DEFAULT_FOLDER_DELAY_MS = 3000;
+const DEFAULT_EXPANSION_DELAY_MS = 5000;
+const DEFAULT_MEDIA_DELAY_MS = 2000;
+
+function parseNonNegativeInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError('value must be a non-negative integer');
+  }
+  return parsed;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function resolveDelayMs(value: unknown, fallback: number): number {
+  return optionalNumber(value) ?? fallback;
+}
+
+function addHttpSafetyOptions(command: Command): Command {
+  return command
+    .option('--audit-http', 'Write redacted HTTP request/response metadata to logs/http-audit-YYYY-MM-DD.jsonl')
+    .option('--audit-http-body', 'Include capped, redacted response snippets in the HTTP audit log')
+    .option('--min-request-delay-ms <n>', 'Minimum spacing between controlled HTTP requests', parseNonNegativeInteger)
+    .option('--request-jitter-ms <n>', 'Random extra delay added to controlled HTTP requests', parseNonNegativeInteger)
+    .option('--request-budget <n>', 'Stop after N controlled HTTP requests in this run', parsePositiveInteger)
+    .option('--max-requests-per-hour <n>', 'Stop after N controlled HTTP requests in a rolling hour', parsePositiveInteger)
+    .option('--rate-limit-floor <n>', 'Stop when X reports remaining rate-limit count at or below N', parseNonNegativeInteger);
+}
+
+function configureHttpSafetyFromOptions(options: any, fallbackMinDelayMs: number): void {
+  const explicitMinDelay = optionalNumber(options.minRequestDelayMs);
+  const envMinDelayConfigured = process.env.FT_HTTP_MIN_DELAY_MS != null;
+  const minDelayMs = explicitMinDelay ?? (envMinDelayConfigured ? undefined : fallbackMinDelayMs);
+  const explicitJitter = optionalNumber(options.requestJitterMs);
+  const envJitterConfigured = process.env.FT_HTTP_JITTER_MS != null;
+  const jitterMs = explicitJitter
+    ?? (envJitterConfigured || minDelayMs == null ? undefined : Math.min(1000, Math.floor(minDelayMs * 0.2)));
+
+  configureHttpSafety({
+    auditHttp: options.auditHttp || options.auditHttpBody ? true : undefined,
+    auditHttpBody: options.auditHttpBody ? true : undefined,
+    minDelayMs,
+    jitterMs,
+    requestBudget: optionalNumber(options.requestBudget),
+    maxRequestsPerHour: optionalNumber(options.maxRequestsPerHour),
+    rateLimitFloor: optionalNumber(options.rateLimitFloor),
+  });
+
+  const auditPath = httpSafetyAuditPath();
+  if (auditPath) console.log(`  HTTP audit: ${auditPath}`);
+}
+
 function printMediaFetchSummary(result: MediaFetchManifest): void {
   if (result.processed === 0) {
     console.log('  ✓ No pending media assets found');
@@ -243,6 +302,9 @@ function printMediaFetchSummary(result: MediaFetchManifest): void {
   }
   if (result.failed > 0) {
     console.log(`  ${result.failed} media assets failed`);
+  }
+  if (result.stopReason) {
+    console.log(`  Paused media fetch: ${result.stopReason}`);
   }
   console.log(`  ✓ Media: ${bookmarkMediaDir()}`);
   console.log(`  ✓ Manifest: ${bookmarkMediaManifestPath()}`);
@@ -824,7 +886,7 @@ export function buildCli() {
 
   // ── sync ────────────────────────────────────────────────────────────────
 
-  program
+  addHttpSafetyOptions(program
     .command('sync')
     .description('Sync bookmarks from X into your local database')
     .option('--api', 'Use OAuth v2 API instead of Chrome session', false)
@@ -840,7 +902,7 @@ export function buildCli() {
     .option('--skip-profile-images', 'Skip downloading author profile images', false)
     .option('--max-pages <n>', 'Max pages to fetch (default: unlimited)', (v: string) => Number(v))
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
-    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
+    .option('--delay-ms <n>', 'Delay between X requests in ms (default: 2000; folders: 3000; gaps/threads: 5000)', parseNonNegativeInteger)
     .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
     .option('--browser <name>', 'Browser to read session from (chrome, chromium, brave, firefox, ...)')
     .option('--cookies <values...>', 'Pass ct0 and auth_token directly (skips browser extraction)')
@@ -850,7 +912,7 @@ export function buildCli() {
     .option('--folders', 'Also sync bookmark folder tags (mirrors X\u2019s current folder state)', false)
     .option('--folder <name>', 'Sync only this folder (case-insensitive, supports unambiguous prefix)')
     .option('--threads', 'Capture parent context and same-author thread continuations', false)
-    .addOption(engineOption())
+    .addOption(engineOption()))
     .action(async (options) => {
       const firstRun = isFirstRun();
       if (firstRun) showSyncWelcome();
@@ -916,6 +978,16 @@ export function buildCli() {
         const mediaMaxBytes = typeof options.mediaMaxBytes === 'number' && !Number.isNaN(options.mediaMaxBytes)
           ? options.mediaMaxBytes
           : DEFAULT_MEDIA_MAX_BYTES;
+        const timelineDelayMs = resolveDelayMs(options.delayMs, DEFAULT_TIMELINE_DELAY_MS);
+        const folderDelayMs = resolveDelayMs(options.delayMs, DEFAULT_FOLDER_DELAY_MS);
+        const expansionDelayMs = resolveDelayMs(options.delayMs, DEFAULT_EXPANSION_DELAY_MS);
+        const safetyDelayMs = syncThreadsEnabled || options.gaps
+          ? expansionDelayMs
+          : folderMode !== 'off'
+            ? folderDelayMs
+            : timelineDelayMs;
+        configureHttpSafetyFromOptions(options, safetyDelayMs);
+
         const postSyncMediaFetch = async (): Promise<void> => {
           if (!downloadMedia) return;
           await runMediaFetchWithProgress({
@@ -947,7 +1019,7 @@ export function buildCli() {
           let result;
           try {
             result = await runWithSpinner(spinner, () => syncThreads({
-              delayMs: Number(options.delayMs) || 300,
+              delayMs: expansionDelayMs,
               browser: options.browser ? String(options.browser) : undefined,
               chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
               chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
@@ -997,7 +1069,7 @@ export function buildCli() {
           });
           const { csrfToken: gapCsrfToken, cookieHeader: gapCookieHeader } = parseCookieOption(options.cookies);
           const result = await runWithSpinner(spinner, () => syncGaps({
-            delayMs: Number(options.delayMs) || 300,
+            delayMs: expansionDelayMs,
             browser: options.browser ? String(options.browser) : undefined,
             chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
             chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
@@ -1126,7 +1198,7 @@ export function buildCli() {
             staleWhenNoNewRecords: continueWithoutCursor,
             maxPages: options.maxPages != null ? Number(options.maxPages) : undefined,
             targetAdds: typeof options.targetAdds === 'number' && !Number.isNaN(options.targetAdds) ? options.targetAdds : undefined,
-            delayMs: Number(options.delayMs) || 600,
+            delayMs: timelineDelayMs,
             maxMinutes: Number(options.maxMinutes) || 30,
             browser: options.browser ? String(options.browser) : undefined,
             csrfToken,
@@ -1177,7 +1249,7 @@ export function buildCli() {
                 chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
                 chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
                 firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
-                delayMs: Number(options.delayMs) || 600,
+                delayMs: folderDelayMs,
                 onlyFolderName: folderMode === 'one' ? folderName : undefined,
                 onProgress: (status: FolderSyncProgress) => {
                   if (status.phase === 'walking' && status.folder) {
@@ -2051,7 +2123,7 @@ export function buildCli() {
 
   // ── fetch-media ─────────────────────────────────────────────────────────
 
-  program
+  addHttpSafetyOptions(program
     .command('fetch-media')
     .description('Download media assets for bookmarks')
     .option('--limit <n>', 'Max pending bookmarks to process (default: all)', (v: string) => Number(v))
@@ -2059,8 +2131,10 @@ export function buildCli() {
     .option('--quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
     .option('--skip-profile-images', 'Skip downloading author profile images')
     .option('--retry-failed', 'Retry failed media entries without waiting for backoff')
+    .option('--delay-ms <n>', 'Minimum delay between media HTTP requests in ms (default: 2000)', parseNonNegativeInteger))
     .action(safe(async (options) => {
       if (!requireData()) return;
+      configureHttpSafetyFromOptions(options, resolveDelayMs(options.delayMs, DEFAULT_MEDIA_DELAY_MS));
       await runMediaFetchWithProgress({
         limit: typeof options.limit === 'number' && !Number.isNaN(options.limit) ? options.limit : undefined,
         maxBytes: typeof options.maxBytes === 'number' && !Number.isNaN(options.maxBytes)

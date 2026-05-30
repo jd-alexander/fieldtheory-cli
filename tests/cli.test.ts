@@ -395,6 +395,9 @@ test('ft sync: media is on by default and exposes --no-media', () => {
   assert.equal(mediaOption.long, '--no-media');
   assert.ok(syncCmd.options.some((o: any) => o.long === '--media-limit'));
   assert.ok(syncCmd.options.some((o: any) => o.long === '--media-quality'));
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--audit-http'));
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--request-budget'));
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--rate-limit-floor'));
 });
 
 test('ft fetch-media exposes media quality option', () => {
@@ -402,6 +405,8 @@ test('ft fetch-media exposes media quality option', () => {
   const fetchMediaCmd = program.commands.find((c: any) => c.name() === 'fetch-media');
   assert.ok(fetchMediaCmd, 'fetch-media command should be registered');
   assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--quality'));
+  assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--audit-http'));
+  assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--request-budget'));
 });
 
 test('ft wiki: description mentions engine prerequisite', () => {
