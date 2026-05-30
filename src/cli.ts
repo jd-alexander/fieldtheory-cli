@@ -6,7 +6,8 @@ import { runTwitterOAuthFlow } from './xauth.js';
 import { syncBookmarksGraphQL, syncGaps, syncBookmarkFolders } from './graphql-bookmarks.js';
 import type { SyncProgress, GapFillProgress, FolderSyncProgress } from './graphql-bookmarks.js';
 import type { BookmarkFolder, QuotedTweetSnapshot } from './types.js';
-import { DEFAULT_MEDIA_MAX_BYTES, fetchBookmarkMediaBatch } from './bookmark-media.js';
+import { DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MEDIA_QUALITY, fetchBookmarkMediaBatch, parseMediaQuality } from './bookmark-media.js';
+import type { MediaQuality } from './bookmark-media.js';
 import type { MediaFetchManifest, MediaFetchProgress } from './bookmark-media.js';
 import {
   buildIndex,
@@ -247,7 +248,7 @@ function printMediaFetchSummary(result: MediaFetchManifest): void {
   console.log(`  ✓ Manifest: ${bookmarkMediaManifestPath()}`);
 }
 
-async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; skipProfileImages?: boolean; retryFailed?: boolean } = {}): Promise<MediaFetchManifest> {
+async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; mediaQuality?: MediaQuality; skipProfileImages?: boolean; retryFailed?: boolean } = {}): Promise<MediaFetchManifest> {
   const startTime = Date.now();
   const controller = new AbortController();
   let lastMedia: MediaFetchProgress = {
@@ -269,6 +270,7 @@ async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: n
   const result = await runWithSpinner(spinner, () => fetchBookmarkMediaBatch({
     limit: options.limit,
     maxBytes: options.maxBytes,
+    mediaQuality: options.mediaQuality,
     skipProfileImages: options.skipProfileImages,
     retryFailed: options.retryFailed,
     signal: controller.signal,
@@ -812,7 +814,9 @@ export function buildCli() {
     .option('--yes', 'Skip confirmation prompts', false)
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
     .option('--no-media', 'Skip downloading media assets after syncing (default: media is downloaded)')
+    .option('--media-limit <n>', 'Cap on pending bookmarks whose media gets fetched after sync (default: all)', (v: string) => Number(v))
     .option('--media-max-bytes <n>', 'Per-asset byte limit for media downloads (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
+    .option('--media-quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
     .option('--skip-profile-images', 'Skip downloading author profile images', false)
     .option('--max-pages <n>', 'Max pages to fetch (default: unlimited)', (v: string) => Number(v))
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
@@ -866,12 +870,28 @@ export function buildCli() {
         // Commander sets options.media=false when --no-media is passed;
         // otherwise it's true by default.
         const downloadMedia = options.media !== false;
+        let mediaQuality: MediaQuality;
+        try {
+          mediaQuality = parseMediaQuality(options.mediaQuality);
+        } catch (error) {
+          console.error(`  Error: ${(error as Error).message}`);
+          process.exitCode = 1;
+          return;
+        }
+        const mediaLimit = typeof options.mediaLimit === 'number' && !Number.isNaN(options.mediaLimit)
+          ? options.mediaLimit
+          : undefined;
         const mediaMaxBytes = typeof options.mediaMaxBytes === 'number' && !Number.isNaN(options.mediaMaxBytes)
           ? options.mediaMaxBytes
           : DEFAULT_MEDIA_MAX_BYTES;
         const postSyncMediaFetch = async (): Promise<void> => {
           if (!downloadMedia) return;
-          await runMediaFetchWithProgress({ maxBytes: mediaMaxBytes, skipProfileImages: Boolean(options.skipProfileImages) });
+          await runMediaFetchWithProgress({
+            limit: mediaLimit,
+            maxBytes: mediaMaxBytes,
+            mediaQuality,
+            skipProfileImages: Boolean(options.skipProfileImages),
+          });
           console.log('');
         };
 
@@ -1948,6 +1968,7 @@ export function buildCli() {
     .description('Download media assets for bookmarks')
     .option('--limit <n>', 'Max pending bookmarks to process (default: all)', (v: string) => Number(v))
     .option('--max-bytes <n>', 'Per-asset byte limit (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
+    .option('--quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
     .option('--skip-profile-images', 'Skip downloading author profile images')
     .option('--retry-failed', 'Retry failed media entries without waiting for backoff')
     .action(safe(async (options) => {
@@ -1957,6 +1978,7 @@ export function buildCli() {
         maxBytes: typeof options.maxBytes === 'number' && !Number.isNaN(options.maxBytes)
           ? options.maxBytes
           : DEFAULT_MEDIA_MAX_BYTES,
+        mediaQuality: parseMediaQuality(options.quality),
         skipProfileImages: Boolean(options.skipProfileImages),
         retryFailed: Boolean(options.retryFailed),
       });

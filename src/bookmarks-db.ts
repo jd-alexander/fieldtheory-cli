@@ -269,6 +269,15 @@ function initSchema(db: Database): void {
     article_title TEXT,
     article_text TEXT,
     article_site TEXT,
+    article_preview_text TEXT,
+    article_summary_text TEXT,
+    article_first_published_at TEXT,
+    article_modified_at TEXT,
+    article_rest_id TEXT,
+    article_id TEXT,
+    article_content_state_json TEXT,
+    article_cover_media_json TEXT,
+    article_media_entities_json TEXT,
     enriched_at TEXT,
     folder_ids TEXT,
     folder_names TEXT
@@ -341,6 +350,15 @@ function ensureMigrations(db: Database): void {
     ensureColumn(db, 'bookmarks', 'article_title', 'TEXT');
     ensureColumn(db, 'bookmarks', 'article_text', 'TEXT');
     ensureColumn(db, 'bookmarks', 'article_site', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_preview_text', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_summary_text', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_first_published_at', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_modified_at', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_rest_id', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_id', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_content_state_json', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_cover_media_json', 'TEXT');
+    ensureColumn(db, 'bookmarks', 'article_media_entities_json', 'TEXT');
     ensureColumn(db, 'bookmarks', 'enriched_at', 'TEXT');
 
     ensureColumn(db, 'bookmarks', 'folder_ids', 'TEXT');
@@ -372,6 +390,15 @@ interface PreservedBookmarkFields {
   articleTitle: string | null;
   articleText: string | null;
   articleSite: string | null;
+  articlePreviewText: string | null;
+  articleSummaryText: string | null;
+  articleFirstPublishedAt: string | null;
+  articleModifiedAt: string | null;
+  articleRestId: string | null;
+  articleId: string | null;
+  articleContentStateJson: string | null;
+  articleCoverMediaJson: string | null;
+  articleMediaEntitiesJson: string | null;
   enrichedAt: string | null;
   folderIds: string | null;
   folderNames: string | null;
@@ -382,6 +409,15 @@ function serializeJsonArray(values: string[] | undefined | null): string | null 
   return JSON.stringify(values);
 }
 
+function serializeJsonValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
 function insertRecord(db: Database, r: BookmarkRecord, preserved?: PreservedBookmarkFields): void {
   // Extract GitHub URLs (kept inline — no LLM needed for URL parsing)
   const text = r.text ?? '';
@@ -390,7 +426,7 @@ function insertRecord(db: Database, r: BookmarkRecord, preserved?: PreservedBook
   const githubUrls = [...new Set([...githubMatches.map((m) => `https://${m}`), ...githubFromLinks])];
 
   db.run(
-    `INSERT OR REPLACE INTO bookmarks VALUES (${Array(37).fill('?').join(',')})`,
+    `INSERT OR REPLACE INTO bookmarks VALUES (${Array(46).fill('?').join(',')})`,
     [
       r.id,
       r.tweetId,
@@ -423,10 +459,19 @@ function insertRecord(db: Database, r: BookmarkRecord, preserved?: PreservedBook
       preserved?.domains ?? null,
       preserved?.primaryDomain ?? null,
       r.quotedTweet ? JSON.stringify(r.quotedTweet) : (preserved?.quotedTweetJson ?? null),
-      preserved?.articleTitle ?? null,
-      preserved?.articleText ?? null,
-      preserved?.articleSite ?? null,
-      preserved?.enrichedAt ?? null,
+      r.articleTitle ?? preserved?.articleTitle ?? null,
+      r.articleText ?? preserved?.articleText ?? null,
+      r.articleSite ?? preserved?.articleSite ?? null,
+      r.articlePreviewText ?? preserved?.articlePreviewText ?? null,
+      r.articleSummaryText ?? preserved?.articleSummaryText ?? null,
+      r.articleFirstPublishedAt ?? preserved?.articleFirstPublishedAt ?? null,
+      r.articleModifiedAt ?? preserved?.articleModifiedAt ?? null,
+      r.articleRestId ?? preserved?.articleRestId ?? null,
+      r.articleId ?? preserved?.articleId ?? null,
+      serializeJsonValue(r.articleContentState) ?? preserved?.articleContentStateJson ?? null,
+      serializeJsonValue(r.articleCoverMedia) ?? preserved?.articleCoverMediaJson ?? null,
+      serializeJsonValue(r.articleMediaEntities) ?? preserved?.articleMediaEntitiesJson ?? null,
+      r.enrichedAt ?? preserved?.enrichedAt ?? null,
       serializeJsonArray(r.folderIds) ?? preserved?.folderIds ?? null,
       serializeJsonArray(r.folderNames) ?? preserved?.folderNames ?? null,
     ]
@@ -459,7 +504,9 @@ export async function buildIndex(options?: { force?: boolean }): Promise<{ dbPat
       const rows = db.exec(
         `SELECT id, categories, primary_category, github_urls, domains, primary_domain,
                 quoted_tweet_json, article_title, article_text, article_site, enriched_at,
-                folder_ids, folder_names
+                folder_ids, folder_names, article_preview_text, article_summary_text,
+                article_first_published_at, article_modified_at, article_rest_id, article_id,
+                article_content_state_json, article_cover_media_json, article_media_entities_json
          FROM bookmarks`
       );
       for (const r of (rows[0]?.values ?? [])) {
@@ -476,6 +523,15 @@ export async function buildIndex(options?: { force?: boolean }): Promise<{ dbPat
           enrichedAt: (r[10] as string) ?? null,
           folderIds: (r[11] as string) ?? null,
           folderNames: (r[12] as string) ?? null,
+          articlePreviewText: (r[13] as string) ?? null,
+          articleSummaryText: (r[14] as string) ?? null,
+          articleFirstPublishedAt: (r[15] as string) ?? null,
+          articleModifiedAt: (r[16] as string) ?? null,
+          articleRestId: (r[17] as string) ?? null,
+          articleId: (r[18] as string) ?? null,
+          articleContentStateJson: (r[19] as string) ?? null,
+          articleCoverMediaJson: (r[20] as string) ?? null,
+          articleMediaEntitiesJson: (r[21] as string) ?? null,
         });
       }
     } catch { /* table may be empty */ }
@@ -1197,6 +1253,15 @@ export interface ArticleUpdate {
   articleTitle: string;
   articleText: string;
   articleSite?: string;
+  articlePreviewText?: string;
+  articleSummaryText?: string;
+  articleFirstPublishedAt?: string;
+  articleModifiedAt?: string;
+  articleRestId?: string;
+  articleId?: string;
+  articleContentState?: unknown;
+  articleCoverMedia?: unknown;
+  articleMediaEntities?: unknown[];
 }
 
 export async function updateArticleContent(
@@ -1209,11 +1274,40 @@ export async function updateArticleContent(
 
   try {
     const stmt = db.prepare(
-      'UPDATE bookmarks SET article_title = ?, article_text = ?, article_site = ?, enriched_at = ? WHERE id = ?'
+      `UPDATE bookmarks SET
+        article_title = ?,
+        article_text = ?,
+        article_site = ?,
+        article_preview_text = ?,
+        article_summary_text = ?,
+        article_first_published_at = ?,
+        article_modified_at = ?,
+        article_rest_id = ?,
+        article_id = ?,
+        article_content_state_json = ?,
+        article_cover_media_json = ?,
+        article_media_entities_json = ?,
+        enriched_at = ?
+       WHERE id = ?`
     );
     const now = new Date().toISOString();
     for (const record of records) {
-      stmt.run([record.articleTitle, record.articleText, record.articleSite ?? null, now, record.id]);
+      stmt.run([
+        record.articleTitle,
+        record.articleText,
+        record.articleSite ?? null,
+        record.articlePreviewText ?? null,
+        record.articleSummaryText ?? null,
+        record.articleFirstPublishedAt ?? null,
+        record.articleModifiedAt ?? null,
+        record.articleRestId ?? null,
+        record.articleId ?? null,
+        serializeJsonValue(record.articleContentState),
+        serializeJsonValue(record.articleCoverMedia),
+        serializeJsonValue(record.articleMediaEntities),
+        now,
+        record.id,
+      ]);
     }
     stmt.free();
     db.run("INSERT INTO bookmarks_fts(bookmarks_fts) VALUES('rebuild')");

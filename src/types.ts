@@ -4,6 +4,12 @@ export interface BookmarkMediaVariant {
   bitrate?: number;
 }
 
+export interface BookmarkTaggedUser {
+  name?: string;
+  screenName?: string;
+  userId?: string;
+}
+
 export interface BookmarkMediaObject {
   url?: string;
   mediaUrl?: string;
@@ -16,19 +22,25 @@ export interface BookmarkMediaObject {
   height?: number;
   videoVariants?: BookmarkMediaVariant[];
   variants?: BookmarkMediaVariant[];
+  taggedUsers?: BookmarkTaggedUser[];
 }
 
 export interface BookmarkAuthorSnapshot {
+  id?: string;
   handle?: string;
   name?: string;
   profileImageUrl?: string;
+  bio?: string;
   description?: string;
   location?: string;
   url?: string;
+  isVerified?: boolean;
   verified?: boolean;
+  followerCount?: number;
   followersCount?: number;
   followingCount?: number;
   statusesCount?: number;
+  snapshotAt?: string;
 }
 
 export interface BookmarkEngagementSnapshot {
@@ -46,7 +58,18 @@ export interface QuotedTweetSnapshot {
   authorHandle?: string;
   authorName?: string;
   authorProfileImageUrl?: string;
+  author?: BookmarkAuthorSnapshot;
   postedAt?: string | null;
+  conversationId?: string;
+  inReplyToStatusId?: string;
+  inReplyToUserId?: string;
+  quotedStatusId?: string;
+  language?: string;
+  sourceApp?: string;
+  possiblySensitive?: boolean;
+  displayTextRange?: [number, number];
+  engagement?: BookmarkEngagementSnapshot;
+  links?: string[];
   media?: string[];
   mediaObjects?: BookmarkMediaObject[];
   url: string;
@@ -71,9 +94,19 @@ export interface BookmarkRecord {
   inReplyToUserId?: string;
   quotedStatusId?: string;
   quotedTweet?: QuotedTweetSnapshot;
+  displayTextRange?: [number, number];
   articleTitle?: string | null;
   articleText?: string | null;
   articleSite?: string | null;
+  articlePreviewText?: string | null;
+  articleSummaryText?: string | null;
+  articleFirstPublishedAt?: string | null;
+  articleModifiedAt?: string | null;
+  articleRestId?: string | null;
+  articleId?: string | null;
+  articleContentState?: unknown;
+  articleCoverMedia?: unknown;
+  articleMediaEntities?: unknown[];
   enrichedAt?: string | null;
   language?: string;
   sourceApp?: string;

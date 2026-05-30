@@ -4,7 +4,15 @@ import { loadChromeSessionConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
 import { extractFirefoxXCookies } from './firefox-cookies.js';
 import { parseTimestampMs } from './date-utils.js';
-import type { BookmarkBackfillState, BookmarkCacheMeta, BookmarkFolder, BookmarkRecord, QuotedTweetSnapshot } from './types.js';
+import type {
+  BookmarkAuthorSnapshot,
+  BookmarkBackfillState,
+  BookmarkCacheMeta,
+  BookmarkFolder,
+  BookmarkMediaObject,
+  BookmarkRecord,
+  QuotedTweetSnapshot,
+} from './types.js';
 import { exportBookmarksForSyncSeed, updateQuotedTweets, updateBookmarkText, updateArticleContent } from './bookmarks-db.js';
 import type { ArticleUpdate } from './bookmarks-db.js';
 import { fetchArticle, resolveTcoLink } from './bookmark-enrich.js';
@@ -38,6 +46,7 @@ const BOOKMARK_FOLDER_TIMELINE_OPERATION = 'BookmarkFolderTimeline';
 
 const GRAPHQL_FEATURES = {
   graphql_timeline_v2_bookmark_timeline: true,
+  view_counts_everywhere_api_enabled: true,
   rweb_tipjar_consumption_enabled: true,
   responsive_web_graphql_exclude_directive_enabled: true,
   verified_phone_label_enabled: false,
@@ -198,6 +207,154 @@ function compareBookmarkChronology(a: BookmarkRecord, b: BookmarkRecord): number
   return aStamp.localeCompare(bStamp);
 }
 
+function parseDisplayTextRange(value: any): [number, number] | undefined {
+  if (!Array.isArray(value) || value.length < 2) return undefined;
+  const start = Number(value[0]);
+  const end = Number(value[1]);
+  return Number.isFinite(start) && Number.isFinite(end) ? [start, end] : undefined;
+}
+
+function extractTaggedUsers(mediaEntity: any): BookmarkMediaObject['taggedUsers'] | undefined {
+  const tags = mediaEntity?.features?.all?.tags;
+  if (!Array.isArray(tags)) return undefined;
+  const users = tags
+    .filter((tag: any) => tag?.type === 'user')
+    .map((tag: any) => ({
+      name: typeof tag.name === 'string' ? tag.name : undefined,
+      screenName: typeof tag.screen_name === 'string' ? tag.screen_name : undefined,
+      userId: typeof tag.user_id === 'string' ? tag.user_id : undefined,
+    }))
+    .filter((tag) => tag.name || tag.screenName || tag.userId);
+  return users.length ? users : undefined;
+}
+
+function extractMediaObjects(mediaEntities: any[]): BookmarkMediaObject[] {
+  return mediaEntities.map((m: any) => ({
+    type: m.type,
+    url: m.media_url_https ?? m.media_url,
+    expandedUrl: m.expanded_url,
+    width: m.original_info?.width,
+    height: m.original_info?.height,
+    altText: m.ext_alt_text,
+    taggedUsers: extractTaggedUsers(m),
+    videoVariants: Array.isArray(m.video_info?.variants)
+      ? m.video_info.variants
+          .filter((v: any) => v.content_type === 'video/mp4')
+          .map((v: any) => ({ bitrate: v.bitrate, url: v.url, contentType: v.content_type }))
+      : undefined,
+  }));
+}
+
+function extractMediaUrls(mediaEntities: any[]): string[] {
+  return mediaEntities
+    .map((m: any) => m.media_url_https ?? m.media_url)
+    .filter(Boolean);
+}
+
+function tweetUrlEntities(legacy: any): any[] {
+  return legacy?.entities?.urls ?? [];
+}
+
+function extractLinks(legacy: any): string[] {
+  return tweetUrlEntities(legacy)
+    .map((u: any) => u.expanded_url)
+    .filter((u: string | undefined) => u && !u.includes('t.co'));
+}
+
+function expandDisplayUrls(text: string, urlEntities: any[]): string {
+  let expanded = text;
+  for (const entity of urlEntities) {
+    if (typeof entity?.url === 'string' && typeof entity?.display_url === 'string') {
+      expanded = expanded.split(entity.url).join(entity.display_url);
+    }
+  }
+  return expanded;
+}
+
+function extractAuthorSnapshot(userResult: any, now: string): BookmarkAuthorSnapshot | undefined {
+  if (!userResult) return undefined;
+  const handle = userResult?.core?.screen_name ?? userResult?.legacy?.screen_name;
+  const name = userResult?.core?.name ?? userResult?.legacy?.name;
+  const profileImageUrl =
+    userResult?.avatar?.image_url ??
+    userResult?.legacy?.profile_image_url_https ??
+    userResult?.legacy?.profile_image_url;
+  const location =
+    typeof userResult?.location === 'object'
+      ? userResult.location.location
+      : userResult?.legacy?.location;
+
+  return {
+    id: userResult.rest_id,
+    handle,
+    name,
+    profileImageUrl,
+    bio: userResult?.legacy?.description,
+    description: userResult?.legacy?.description,
+    followerCount: userResult?.legacy?.followers_count,
+    followingCount: userResult?.legacy?.friends_count,
+    followersCount: userResult?.legacy?.followers_count,
+    isVerified: Boolean(userResult?.is_blue_verified ?? userResult?.legacy?.verified),
+    verified: Boolean(userResult?.is_blue_verified ?? userResult?.legacy?.verified),
+    location,
+    snapshotAt: now,
+  };
+}
+
+function extractEngagement(tweet: any, legacy: any): BookmarkRecord['engagement'] {
+  return {
+    likeCount: legacy?.favorite_count,
+    repostCount: legacy?.retweet_count,
+    replyCount: legacy?.reply_count,
+    quoteCount: legacy?.quote_count,
+    bookmarkCount: legacy?.bookmark_count,
+    viewCount: tweet?.views?.count ? Number(tweet.views.count) : undefined,
+  };
+}
+
+function buildQuotedTweetSnapshot(value: any, fallbackId: string | undefined, now: string): QuotedTweetSnapshot | null {
+  const tweet = value?.tweet ?? value;
+  const legacy = tweet?.legacy;
+  if (!legacy) return null;
+
+  const id = String(legacy.id_str ?? tweet?.rest_id ?? fallbackId ?? '');
+  if (!id) return null;
+
+  const userResult = tweet?.core?.user_results?.result;
+  const handle = userResult?.core?.screen_name ?? userResult?.legacy?.screen_name;
+  const authorProfileImageUrl =
+    userResult?.avatar?.image_url ??
+    userResult?.legacy?.profile_image_url_https ??
+    userResult?.legacy?.profile_image_url;
+  const urlEntities = tweetUrlEntities(legacy);
+  const noteText = tweet?.note_tweet?.note_tweet_results?.result?.text;
+  const text = expandDisplayUrls(noteText ?? legacy.full_text ?? legacy.text ?? '', urlEntities);
+  const mediaEntities: any[] = legacy?.extended_entities?.media ?? legacy?.entities?.media ?? [];
+
+  return {
+    id,
+    text,
+    authorHandle: handle,
+    authorName: userResult?.core?.name ?? userResult?.legacy?.name,
+    authorProfileImageUrl,
+    author: extractAuthorSnapshot(userResult, now),
+    postedAt: legacy.created_at ?? null,
+    conversationId: legacy.conversation_id_str,
+    inReplyToStatusId: legacy.in_reply_to_status_id_str,
+    inReplyToUserId: legacy.in_reply_to_user_id_str,
+    quotedStatusId: legacy.quoted_status_id_str,
+    language: legacy.lang,
+    sourceApp: legacy.source,
+    possiblySensitive: legacy.possibly_sensitive,
+    displayTextRange: parseDisplayTextRange(legacy.display_text_range),
+    engagement: extractEngagement(tweet, legacy),
+    links: extractLinks(legacy),
+    media: extractMediaUrls(mediaEntities),
+    mediaObjects: extractMediaObjects(mediaEntities),
+    url: `https://x.com/${handle ?? '_'}/status/${id}`,
+  };
+}
+
 async function loadExistingBookmarks(): Promise<{ records: BookmarkRecord[]; repaired: number }> {
   const cachePath = twitterBookmarksCachePath();
   const existing = sanitizeRecords(await readJsonLines<BookmarkRecord>(cachePath));
@@ -253,94 +410,25 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     userResult?.legacy?.profile_image_url_https ??
     userResult?.legacy?.profile_image_url;
 
-  const author = userResult
-    ? {
-        id: userResult.rest_id,
-        handle: authorHandle,
-        name: authorName,
-        profileImageUrl: authorProfileImageUrl,
-        bio: userResult?.legacy?.description,
-        followerCount: userResult?.legacy?.followers_count,
-        followingCount: userResult?.legacy?.friends_count,
-        isVerified: Boolean(userResult?.is_blue_verified ?? userResult?.legacy?.verified),
-        location:
-          typeof userResult?.location === 'object'
-            ? userResult.location.location
-            : userResult?.legacy?.location,
-        snapshotAt: now,
-      }
-    : undefined;
+  const author = extractAuthorSnapshot(userResult, now);
 
   const mediaEntities = legacy?.extended_entities?.media ?? legacy?.entities?.media ?? [];
-  const media: string[] = mediaEntities
-    .map((m: any) => m.media_url_https ?? m.media_url)
-    .filter(Boolean);
-  const mediaObjects = mediaEntities.map((m: any) => ({
-    type: m.type,
-    url: m.media_url_https ?? m.media_url,
-    expandedUrl: m.expanded_url,
-    width: m.original_info?.width,
-    height: m.original_info?.height,
-    altText: m.ext_alt_text,
-    videoVariants: Array.isArray(m.video_info?.variants)
-      ? m.video_info.variants
-          .filter((v: any) => v.content_type === 'video/mp4')
-          .map((v: any) => ({ bitrate: v.bitrate, url: v.url }))
-      : undefined,
-  }));
+  const media: string[] = extractMediaUrls(mediaEntities);
+  const mediaObjects = extractMediaObjects(mediaEntities);
 
-  const urlEntities = legacy?.entities?.urls ?? [];
-  const links: string[] = urlEntities
-    .map((u: any) => u.expanded_url)
-    .filter((u: string | undefined) => u && !u.includes('t.co'));
+  const urlEntities = tweetUrlEntities(legacy);
+  const links: string[] = extractLinks(legacy);
 
   // Extract quoted tweet if present
   const quotedResult = tweet?.quoted_status_result?.result;
   let quotedTweet: BookmarkRecord['quotedTweet'] | undefined;
   if (quotedResult) {
-    const qtTweet = quotedResult.tweet ?? quotedResult;
-    const qtLegacy = qtTweet?.legacy;
-    if (qtLegacy) {
-      const qtId = qtLegacy.id_str ?? qtTweet?.rest_id;
-      const qtUser = qtTweet?.core?.user_results?.result;
-      const qtHandle = qtUser?.core?.screen_name ?? qtUser?.legacy?.screen_name;
-      const qtMediaEntities = qtLegacy?.extended_entities?.media ?? qtLegacy?.entities?.media ?? [];
-      const qtNoteText = qtTweet?.note_tweet?.note_tweet_results?.result?.text;
-      quotedTweet = {
-        id: qtId,
-        text: qtNoteText ?? qtLegacy.full_text ?? qtLegacy.text ?? '',
-        authorHandle: qtHandle,
-        authorName: qtUser?.core?.name ?? qtUser?.legacy?.name,
-        authorProfileImageUrl:
-          qtUser?.avatar?.image_url ?? qtUser?.legacy?.profile_image_url_https,
-        postedAt: qtLegacy.created_at ?? null,
-        media: qtMediaEntities.map((m: any) => m.media_url_https ?? m.media_url).filter(Boolean),
-        mediaObjects: qtMediaEntities.map((m: any) => ({
-          type: m.type,
-          url: m.media_url_https ?? m.media_url,
-          expandedUrl: m.expanded_url,
-          width: m.original_info?.width,
-          height: m.original_info?.height,
-          altText: m.ext_alt_text,
-          videoVariants: Array.isArray(m.video_info?.variants)
-            ? m.video_info.variants
-                .filter((v: any) => v.content_type === 'video/mp4')
-                .map((v: any) => ({ bitrate: v.bitrate, url: v.url }))
-            : undefined,
-        })),
-        url: `https://x.com/${qtHandle ?? '_'}/status/${qtId}`,
-      };
-    }
+    quotedTweet = buildQuotedTweetSnapshot(quotedResult, legacy.quoted_status_id_str, now) ?? undefined;
   }
 
   // X Articles / long-form note tweets store full text separately
   const noteTweetText = tweet?.note_tweet?.note_tweet_results?.result?.text;
-  let text = noteTweetText ?? legacy.full_text ?? legacy.text ?? '';
-  for (const entity of urlEntities) {
-    if (typeof entity?.url === 'string' && typeof entity?.display_url === 'string') {
-      text = text.split(entity.url).join(entity.display_url);
-    }
-  }
+  const text = expandDisplayUrls(noteTweetText ?? legacy.full_text ?? legacy.text ?? '', urlEntities);
 
   return {
     id: tweetId,
@@ -359,17 +447,11 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     inReplyToUserId: legacy.in_reply_to_user_id_str,
     quotedStatusId: legacy.quoted_status_id_str,
     quotedTweet,
+    displayTextRange: parseDisplayTextRange(legacy.display_text_range),
     language: legacy.lang,
     sourceApp: legacy.source,
     possiblySensitive: legacy.possibly_sensitive,
-    engagement: {
-      likeCount: legacy.favorite_count,
-      repostCount: legacy.retweet_count,
-      replyCount: legacy.reply_count,
-      quoteCount: legacy.quote_count,
-      bookmarkCount: legacy.bookmark_count,
-      viewCount: tweet?.views?.count ? Number(tweet.views.count) : undefined,
-    },
+    engagement: extractEngagement(tweet, legacy),
     media,
     mediaObjects,
     links,
@@ -1477,37 +1559,8 @@ export function parseTweetResultByRestId(json: any, tweetId: string): QuotedTwee
   if (!result) return null;
   // X may wrap the tweet inside a TweetWithVisibilityResults / TweetTombstone.
   // Unwrap the same way the bookmarks parser does in convertTweetToRecord.
-  const tweet = result.tweet ?? result;
-  const legacy = tweet?.legacy;
-  if (!legacy) return null;
-
-  const noteText = tweet?.note_tweet?.note_tweet_results?.result?.text;
-  const text = noteText ?? legacy.full_text ?? legacy.text ?? '';
-  if (!text) return null;
-
-  const userResult = tweet?.core?.user_results?.result;
-  const handle = userResult?.core?.screen_name ?? userResult?.legacy?.screen_name;
-  const mediaEntities: any[] = legacy?.extended_entities?.media ?? legacy?.entities?.media ?? [];
-  const resolvedId = String(legacy.id_str ?? tweet?.rest_id ?? tweetId);
-
-  return {
-    id: resolvedId,
-    text,
-    authorHandle: handle,
-    authorName: userResult?.core?.name ?? userResult?.legacy?.name,
-    authorProfileImageUrl:
-      userResult?.avatar?.image_url ?? userResult?.legacy?.profile_image_url_https,
-    postedAt: legacy.created_at ?? null,
-    media: mediaEntities.map((m: any) => m.media_url_https ?? m.media_url).filter(Boolean),
-    mediaObjects: mediaEntities.map((m: any) => ({
-      type: m.type,
-      url: m.media_url_https ?? m.media_url,
-      expandedUrl: m.expanded_url,
-      width: m.original_info?.width,
-      height: m.original_info?.height,
-    })),
-    url: `https://x.com/${handle ?? '_'}/status/${resolvedId}`,
-  };
+  const snapshot = buildQuotedTweetSnapshot(result, tweetId, new Date().toISOString());
+  return snapshot?.text ? snapshot : null;
 }
 
 function unwrapGraphqlResult(value: any): any {
@@ -1542,6 +1595,12 @@ function blockText(block: any): string {
   }
 
   return '';
+}
+
+function secondsToIso(value: any): string | undefined {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return new Date(seconds * 1000).toISOString();
 }
 
 function articleFromCandidate(candidate: any): ArticleContent | null {
@@ -1580,7 +1639,62 @@ function articleFromCandidate(candidate: any): ArticleContent | null {
       ? candidate.site_name
       : undefined;
 
-  return { title, text, siteName };
+  const mediaEntities = Array.isArray(candidate.media_entities)
+    ? candidate.media_entities
+    : undefined;
+
+  return {
+    title,
+    text,
+    siteName,
+    previewText: typeof candidate.preview_text === 'string' ? candidate.preview_text : undefined,
+    summaryText: typeof candidate.summary_text === 'string' ? candidate.summary_text : undefined,
+    firstPublishedAt: secondsToIso(candidate.metadata?.first_published_at_secs),
+    modifiedAt: secondsToIso(candidate.lifecycle_state?.modified_at_secs),
+    articleRestId: typeof candidate.rest_id === 'string' ? candidate.rest_id : undefined,
+    articleId: typeof candidate.id === 'string' ? candidate.id : undefined,
+    contentState: candidate.content_state && typeof candidate.content_state === 'object'
+      ? candidate.content_state
+      : undefined,
+    coverMedia: candidate.cover_media && typeof candidate.cover_media === 'object'
+      ? candidate.cover_media
+      : undefined,
+    mediaEntities,
+  };
+}
+
+function articleUpdate(id: string, article: ArticleContent): ArticleUpdate {
+  return {
+    id,
+    articleTitle: article.title,
+    articleText: article.text,
+    articleSite: article.siteName,
+    articlePreviewText: article.previewText,
+    articleSummaryText: article.summaryText,
+    articleFirstPublishedAt: article.firstPublishedAt,
+    articleModifiedAt: article.modifiedAt,
+    articleRestId: article.articleRestId,
+    articleId: article.articleId,
+    articleContentState: article.contentState,
+    articleCoverMedia: article.coverMedia,
+    articleMediaEntities: article.mediaEntities,
+  };
+}
+
+function applyArticleToRecord(record: BookmarkRecord, article: ArticleContent, enrichedAt: string): void {
+  record.articleTitle = article.title;
+  record.articleText = article.text;
+  record.articleSite = article.siteName;
+  record.articlePreviewText = article.previewText;
+  record.articleSummaryText = article.summaryText;
+  record.articleFirstPublishedAt = article.firstPublishedAt;
+  record.articleModifiedAt = article.modifiedAt;
+  record.articleRestId = article.articleRestId;
+  record.articleId = article.articleId;
+  record.articleContentState = article.contentState;
+  record.articleCoverMedia = article.coverMedia;
+  record.articleMediaEntities = article.mediaEntities;
+  record.enrichedAt = enrichedAt;
 }
 
 export function parseTweetArticleByRestId(json: any): ArticleContent | null {
@@ -1690,13 +1804,8 @@ async function fetchTweetViaSyndication(tweetId: string): Promise<TweetFetchResu
           authorName: data.user?.name,
           authorProfileImageUrl: data.user?.profile_image_url_https,
           postedAt: data.created_at ?? null,
-          media: mediaEntities.map((m: any) => m.media_url_https ?? m.media_url).filter(Boolean),
-          mediaObjects: mediaEntities.map((m: any) => ({
-            type: m.type,
-            url: m.media_url_https ?? m.media_url,
-            width: m.original_info?.width,
-            height: m.original_info?.height,
-          })),
+          media: extractMediaUrls(mediaEntities),
+          mediaObjects: extractMediaObjects(mediaEntities),
           url: `https://x.com/${handle ?? '_'}/status/${data.id_str ?? tweetId}`,
         },
       };
@@ -1983,12 +2092,8 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
     if (article) {
       for (const record of recordsByXArticleTweetId.get(tweetId) ?? []) {
         if (enrichedIds.has(record.id)) continue;
-        articleDbUpdates.push({
-          id: record.id,
-          articleTitle: article.title,
-          articleText: article.text,
-          articleSite: article.siteName,
-        });
+        applyArticleToRecord(record, article, now);
+        articleDbUpdates.push(articleUpdate(record.id, article));
         enrichedIds.add(record.id);
         articlesEnriched++;
       }
@@ -2053,12 +2158,7 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
     if (targetUrl) {
       const article = await fetchArticle(targetUrl);
       if (article && article.text.length >= 50) {
-        articleDbUpdates.push({
-          id: record.id,
-          articleTitle: article.title,
-          articleText: article.text,
-          articleSite: article.siteName,
-        });
+        articleDbUpdates.push(articleUpdate(record.id, article));
         articlesEnriched++;
       }
     }

@@ -19,6 +19,15 @@ export interface ArticleContent {
   title: string;
   text: string;
   siteName?: string;
+  previewText?: string;
+  summaryText?: string;
+  firstPublishedAt?: string;
+  modifiedAt?: string;
+  articleRestId?: string;
+  articleId?: string;
+  contentState?: unknown;
+  coverMedia?: unknown;
+  mediaEntities?: unknown[];
 }
 
 // ── HTML helpers ───────────────────────────────────────────────────────────

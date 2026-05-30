@@ -6,6 +6,9 @@ import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksCachePath 
 import type { BookmarkRecord } from './types.js';
 
 export const DEFAULT_MEDIA_MAX_BYTES = 200 * 1024 * 1024;
+export const MEDIA_QUALITY_VALUES = ['medium', 'large', '4096x4096', 'orig'] as const;
+export type MediaQuality = typeof MEDIA_QUALITY_VALUES[number];
+export const DEFAULT_MEDIA_QUALITY: MediaQuality = 'medium';
 
 export interface MediaFetchEntry {
   bookmarkId: string;
@@ -27,6 +30,7 @@ export interface MediaFetchManifest {
   generatedAt: string;
   limit: number;
   maxBytes: number;
+  mediaQuality?: MediaQuality;
   processed: number;
   downloaded: number;
   skippedTooLarge: number;
@@ -61,6 +65,8 @@ interface MediaTargetSource {
   authorProfileImageUrl?: string;
   media?: string[];
   mediaObjects?: BookmarkRecord['mediaObjects'];
+  articleCoverMedia?: unknown;
+  articleMediaEntities?: unknown[];
 }
 
 interface CachedMediaResult {
@@ -96,15 +102,53 @@ function sanitizeExtFromContentType(contentType?: string, sourceUrl?: string): s
   return '.bin';
 }
 
+export function parseMediaQuality(value: unknown): MediaQuality {
+  const quality = String(value ?? DEFAULT_MEDIA_QUALITY);
+  if ((MEDIA_QUALITY_VALUES as readonly string[]).includes(quality)) return quality as MediaQuality;
+  throw new Error(`Invalid media quality "${quality}". Use one of: ${MEDIA_QUALITY_VALUES.join(', ')}`);
+}
+
+function applyPhotoMediaQuality(sourceUrl: string, quality: MediaQuality): string {
+  if (quality === 'medium') return sourceUrl;
+  try {
+    const parsed = new URL(sourceUrl);
+    if (parsed.hostname !== 'pbs.twimg.com' || !parsed.pathname.startsWith('/media/')) {
+      return sourceUrl;
+    }
+    parsed.searchParams.set('name', quality);
+    return parsed.toString();
+  } catch {
+    return sourceUrl;
+  }
+}
+
+function extractArticleMediaUrl(media: unknown): string | undefined {
+  if (!media || typeof media !== 'object') return undefined;
+  const value = media as any;
+  return value.media_info?.original_img_url ??
+    value.mediaInfo?.originalImgUrl ??
+    value.original_img_url ??
+    value.originalImageUrl ??
+    value.url;
+}
+
 async function loadManifest(): Promise<MediaFetchManifest | null> {
   const manifestPath = bookmarkMediaManifestPath();
   if (!(await pathExists(manifestPath))) return null;
   return readJson<MediaFetchManifest>(manifestPath);
 }
 
-function hasTargets(source: { media?: unknown[]; mediaObjects?: unknown[]; authorProfileImageUrl?: string } | undefined): boolean {
+function hasArticleMediaTargets(source: { articleCoverMedia?: unknown; articleMediaEntities?: unknown[] } | undefined): boolean {
   if (!source) return false;
-  return (source.media?.length ?? 0) > 0 || (source.mediaObjects?.length ?? 0) > 0 || Boolean(source.authorProfileImageUrl);
+  return Boolean(extractArticleMediaUrl(source.articleCoverMedia)) || (source.articleMediaEntities ?? []).some((entity) => Boolean(extractArticleMediaUrl(entity)));
+}
+
+function hasTargets(source: { media?: unknown[]; mediaObjects?: unknown[]; authorProfileImageUrl?: string; articleCoverMedia?: unknown; articleMediaEntities?: unknown[] } | undefined): boolean {
+  if (!source) return false;
+  return (source.media?.length ?? 0) > 0 ||
+    (source.mediaObjects?.length ?? 0) > 0 ||
+    Boolean(source.authorProfileImageUrl) ||
+    hasArticleMediaTargets(source);
 }
 
 function hasMediaCandidate(bookmark: BookmarkRecord): boolean {
@@ -136,6 +180,7 @@ function appendMediaTargets(
   source: MediaTargetSource,
   downloadedProfileImageUrls: Set<string>,
   skipProfileImages: boolean,
+  mediaQuality: MediaQuality,
 ): void {
   const base = {
     bookmarkId,
@@ -156,12 +201,20 @@ function appendMediaTargets(
         pushTarget(targets, seenKeys, base, mp4s[0]?.url, false);
         continue;
       }
-      pushTarget(targets, seenKeys, base, previewUrl, false);
+      pushTarget(targets, seenKeys, base, previewUrl ? applyPhotoMediaQuality(previewUrl, mediaQuality) : undefined, false);
     }
   } else {
     for (const mediaUrl of source.media ?? []) {
-      pushTarget(targets, seenKeys, base, mediaUrl, false);
+      pushTarget(targets, seenKeys, base, applyPhotoMediaQuality(mediaUrl, mediaQuality), false);
     }
+  }
+
+  const articleMediaUrls = [
+    extractArticleMediaUrl(source.articleCoverMedia),
+    ...(source.articleMediaEntities ?? []).map(extractArticleMediaUrl),
+  ];
+  for (const mediaUrl of articleMediaUrls) {
+    pushTarget(targets, seenKeys, base, mediaUrl ? applyPhotoMediaQuality(mediaUrl, mediaQuality) : undefined, false);
   }
 
   if (source.authorProfileImageUrl && !skipProfileImages) {
@@ -176,6 +229,7 @@ function resolveMediaTargets(
   bookmark: BookmarkRecord,
   downloadedProfileImageUrls: Set<string>,
   skipProfileImages: boolean,
+  mediaQuality: MediaQuality,
 ): MediaFetchTarget[] {
   const targets: MediaFetchTarget[] = [];
   const seenKeys = new Set<string>();
@@ -188,7 +242,9 @@ function resolveMediaTargets(
     authorProfileImageUrl: bookmark.authorProfileImageUrl,
     media: bookmark.media,
     mediaObjects: bookmark.mediaObjects,
-  }, downloadedProfileImageUrls, skipProfileImages);
+    articleCoverMedia: bookmark.articleCoverMedia,
+    articleMediaEntities: bookmark.articleMediaEntities,
+  }, downloadedProfileImageUrls, skipProfileImages, mediaQuality);
 
   if (bookmark.quotedTweet) {
     appendMediaTargets(targets, seenKeys, bookmark.id, {
@@ -199,7 +255,7 @@ function resolveMediaTargets(
       authorProfileImageUrl: bookmark.quotedTweet.authorProfileImageUrl,
       media: bookmark.quotedTweet.media,
       mediaObjects: bookmark.quotedTweet.mediaObjects,
-    }, downloadedProfileImageUrls, skipProfileImages);
+    }, downloadedProfileImageUrls, skipProfileImages, mediaQuality);
   }
 
   return targets;
@@ -254,15 +310,16 @@ function hasPendingMediaTarget(
   coveredAssetKeys: Set<string>,
   coveredProfileImageUrls: Set<string>,
   skipProfileImages: boolean,
+  mediaQuality: MediaQuality,
 ): boolean {
-  return resolveMediaTargets(bookmark, coveredProfileImageUrls, skipProfileImages).some(({ tweetId, sourceUrl, isProfileImage }) => {
+  return resolveMediaTargets(bookmark, coveredProfileImageUrls, skipProfileImages, mediaQuality).some(({ tweetId, sourceUrl, isProfileImage }) => {
     if (isProfileImage) return true;
     return !coveredAssetKeys.has(`${tweetId}::${sourceUrl}`);
   });
 }
 
 export async function fetchBookmarkMediaBatch(
-  options: { limit?: number; maxBytes?: number; skipProfileImages?: boolean; retryFailed?: boolean; signal?: AbortSignal; onProgress?: (progress: MediaFetchProgress) => void } = {}
+  options: { limit?: number; maxBytes?: number; skipProfileImages?: boolean; retryFailed?: boolean; mediaQuality?: MediaQuality; signal?: AbortSignal; onProgress?: (progress: MediaFetchProgress) => void } = {}
 ): Promise<MediaFetchManifest> {
   const limit = typeof options.limit === 'number' && !Number.isNaN(options.limit)
     ? Math.max(0, options.limit)
@@ -270,6 +327,7 @@ export async function fetchBookmarkMediaBatch(
   const maxBytes = options.maxBytes ?? DEFAULT_MEDIA_MAX_BYTES;
   const skipProfileImages = options.skipProfileImages ?? false;
   const retryFailed = options.retryFailed ?? false;
+  const mediaQuality = options.mediaQuality ?? DEFAULT_MEDIA_QUALITY;
   const nowMs = Date.now();
   const mediaDir = bookmarkMediaDir();
   const manifestPath = bookmarkMediaManifestPath();
@@ -281,7 +339,7 @@ export async function fetchBookmarkMediaBatch(
   const bookmarks = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
   const candidates = bookmarks
     .filter(hasMediaCandidate)
-    .filter((bookmark) => hasPendingMediaTarget(bookmark, coveredAssetKeys, coveredProfileImageUrls, skipProfileImages))
+    .filter((bookmark) => hasPendingMediaTarget(bookmark, coveredAssetKeys, coveredProfileImageUrls, skipProfileImages, mediaQuality))
     .slice(0, limit);
   const entriesByKey = new Map((previous?.entries ?? []).map((entry) => [mediaEntryKeyFromEntry(entry), entry]));
   const cachedResultsBySourceUrl = new Map<string, CachedMediaResult>();
@@ -344,7 +402,7 @@ export async function fetchBookmarkMediaBatch(
 
   for (const bookmark of candidates) {
     if (options.signal?.aborted) break;
-    const mediaTargets = resolveMediaTargets(bookmark, coveredProfileImageUrls, skipProfileImages);
+    const mediaTargets = resolveMediaTargets(bookmark, coveredProfileImageUrls, skipProfileImages, mediaQuality);
 
     for (const target of mediaTargets) {
       if (options.signal?.aborted) break;
@@ -516,6 +574,7 @@ export async function fetchBookmarkMediaBatch(
     generatedAt: new Date().toISOString(),
     limit: manifestLimit,
     maxBytes,
+    mediaQuality,
     processed,
     downloaded,
     skippedTooLarge,

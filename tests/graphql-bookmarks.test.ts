@@ -187,6 +187,31 @@ test('convertTweetToRecord: extracts media objects', () => {
   assert.equal(result.mediaObjects![0].altText, 'A test image');
 });
 
+test('convertTweetToRecord: preserves photo tagged users', () => {
+  const result = convertTweetToRecord(makeTweetResult({
+    legacy: {
+      extended_entities: {
+        media: [{
+          type: 'photo',
+          media_url_https: 'https://pbs.twimg.com/media/tagged.jpg',
+          features: {
+            all: {
+              tags: [
+                { type: 'user', name: 'Tagged Brand', screen_name: 'taggedbrand', user_id: '42' },
+                { type: 'topic', name: 'ignored' },
+              ],
+            },
+          },
+        }],
+      },
+    },
+  }), NOW)!;
+
+  assert.deepEqual(result.mediaObjects?.[0]?.taggedUsers, [
+    { name: 'Tagged Brand', screenName: 'taggedbrand', userId: '42' },
+  ]);
+});
+
 test('convertTweetToRecord: extracts links, filtering out t.co', () => {
   const result = convertTweetToRecord(makeTweetResult(), NOW)!;
 
@@ -287,9 +312,18 @@ test('convertTweetToRecord: extracts quoted tweet snapshot', () => {
           rest_id: '5555555',
           legacy: {
             id_str: '5555555',
-            full_text: 'This is the quoted tweet text',
+            full_text: 'This is the quoted tweet text https://t.co/q',
             created_at: 'Mon Mar 09 10:00:00 +0000 2026',
-            entities: { urls: [] },
+            conversation_id_str: '3333333',
+            in_reply_to_status_id_str: '2222222',
+            lang: 'en',
+            favorite_count: 11,
+            retweet_count: 4,
+            reply_count: 2,
+            quote_count: 1,
+            bookmark_count: 9,
+            display_text_range: [0, 30],
+            entities: { urls: [{ url: 'https://t.co/q', expanded_url: 'https://example.com/q', display_url: 'example.com/q' }] },
             extended_entities: {
               media: [{
                 type: 'photo',
@@ -299,6 +333,7 @@ test('convertTweetToRecord: extracts quoted tweet snapshot', () => {
               }],
             },
           },
+          views: { count: '1234' },
           core: {
             user_results: {
               result: {
@@ -318,9 +353,16 @@ test('convertTweetToRecord: extracts quoted tweet snapshot', () => {
   assert.equal(result.quotedStatusId, '5555555');
   assert.ok(result.quotedTweet);
   assert.equal(result.quotedTweet!.id, '5555555');
-  assert.equal(result.quotedTweet!.text, 'This is the quoted tweet text');
+  assert.equal(result.quotedTweet!.text, 'This is the quoted tweet text example.com/q');
   assert.equal(result.quotedTweet!.authorHandle, 'quoteduser');
   assert.equal(result.quotedTweet!.url, 'https://x.com/quoteduser/status/5555555');
+  assert.equal(result.quotedTweet!.conversationId, '3333333');
+  assert.equal(result.quotedTweet!.inReplyToStatusId, '2222222');
+  assert.equal(result.quotedTweet!.language, 'en');
+  assert.equal(result.quotedTweet!.engagement?.viewCount, 1234);
+  assert.deepEqual(result.quotedTweet!.displayTextRange, [0, 30]);
+  assert.deepEqual(result.quotedTweet!.links, ['https://example.com/q']);
+  assert.equal(result.quotedTweet!.author?.id, '6666');
   assert.equal(result.quotedTweet!.media?.length, 1);
 });
 
@@ -493,6 +535,26 @@ test('parseTweetArticleByRestId: extracts current X Article content_state shape'
               result: {
                 title: 'Thoughts and Feelings around Claude Design',
                 plain_text: 'I tried Claude Design yesterday and I have a theory for how this whole thing shakes out.',
+                preview_text: 'A short preview',
+                summary_text: 'A short summary',
+                rest_id: 'article-2045',
+                id: 'QXJ0aWNsZTo=',
+                metadata: { first_published_at_secs: 1780000000 },
+                lifecycle_state: { modified_at_secs: 1780000100 },
+                cover_media: {
+                  media_info: {
+                    original_img_url: 'https://pbs.twimg.com/media/cover.jpg',
+                    original_img_width: 1200,
+                    original_img_height: 800,
+                  },
+                },
+                media_entities: [
+                  {
+                    media_info: {
+                      original_img_url: 'https://pbs.twimg.com/media/inline.jpg',
+                    },
+                  },
+                ],
                 content_state: {
                   blocks: [
                     { text: 'I tried Claude Design yesterday and I have a theory for how this whole thing shakes out.' },
@@ -512,6 +574,20 @@ test('parseTweetArticleByRestId: extracts current X Article content_state shape'
   assert.equal(article.title, 'Thoughts and Feelings around Claude Design');
   assert.match(article.text, /I tried Claude Design yesterday/);
   assert.match(article.text, /components, styles, variables, and props/);
+  assert.equal(article.previewText, 'A short preview');
+  assert.equal(article.summaryText, 'A short summary');
+  assert.equal(article.articleRestId, 'article-2045');
+  assert.equal(article.articleId, 'QXJ0aWNsZTo=');
+  assert.equal(article.firstPublishedAt, '2026-05-28T20:26:40.000Z');
+  assert.equal(article.modifiedAt, '2026-05-28T20:28:20.000Z');
+  assert.deepEqual(article.coverMedia, {
+    media_info: {
+      original_img_url: 'https://pbs.twimg.com/media/cover.jpg',
+      original_img_width: 1200,
+      original_img_height: 800,
+    },
+  });
+  assert.equal((article.mediaEntities?.[0] as any)?.media_info?.original_img_url, 'https://pbs.twimg.com/media/inline.jpg');
 });
 
 test('parseTweetResultByRestId: returns null on tombstone / unavailable tweets', () => {

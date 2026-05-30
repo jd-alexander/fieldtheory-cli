@@ -81,6 +81,103 @@ test('fetchBookmarkMediaBatch downloads post media from GraphQL mediaObjects sha
   }
 });
 
+test('fetchBookmarkMediaBatch applies requested photo quality to pbs media URLs', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/example.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'media quality test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 1024, mediaQuality: 'orig' });
+      assert.equal(manifest.mediaQuality, 'orig');
+      assert.equal(
+        manifest.entries.find((entry) => entry.status === 'downloaded')?.sourceUrl,
+        'https://pbs.twimg.com/media/example.jpg?name=orig',
+      );
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchBookmarkMediaBatch downloads X Article cover and inline images', async () => {
+  const coverUrl = 'https://pbs.twimg.com/media/article-cover.jpg';
+  const inlineUrl = 'https://pbs.twimg.com/media/article-inline.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'article media test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    mediaObjects: [],
+    articleCoverMedia: { media_info: { original_img_url: coverUrl } },
+    articleMediaEntities: [{ media_info: { original_img_url: inlineUrl } }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 1024, mediaQuality: 'large' });
+      const downloaded = manifest.entries
+        .filter((entry) => entry.status === 'downloaded')
+        .map((entry) => entry.sourceUrl)
+        .sort();
+
+      assert.deepEqual(downloaded, [
+        `${coverUrl}?name=large`,
+        `${inlineUrl}?name=large`,
+      ].sort());
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('fetchBookmarkMediaBatch downloads quoted tweet media targets', async () => {
   const quotedPhotoUrl = 'https://pbs.twimg.com/media/quoted-photo.jpg';
   const quotedPosterUrl = 'https://pbs.twimg.com/amplify_video_thumb/quoted.jpg';
