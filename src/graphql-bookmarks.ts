@@ -856,9 +856,11 @@ export async function syncBookmarksGraphQL(
 // accumulates. NEVER writes to X — only reads.
 // ──────────────────────────────────────────────────────────────────────────
 
-function buildFoldersListUrl(): string {
+function buildFoldersListUrl(cursor?: string): string {
+  const variables: Record<string, unknown> = {};
+  if (cursor) variables.cursor = cursor;
   const params = new URLSearchParams({
-    variables: JSON.stringify({}),
+    variables: JSON.stringify(variables),
     features: JSON.stringify(GRAPHQL_FEATURES),
   });
   return `https://x.com/i/api/graphql/${BOOKMARK_FOLDERS_QUERY_ID}/${BOOKMARK_FOLDERS_OPERATION}?${params}`;
@@ -881,35 +883,53 @@ export async function fetchBookmarkFolders(
   csrfToken: string,
   cookieHeader?: string,
 ): Promise<BookmarkFolder[]> {
-  const response = await fetch(buildFoldersListUrl(), {
-    headers: buildHeaders(csrfToken, cookieHeader),
-  });
+  const folders: BookmarkFolder[] = [];
+  const seenIds = new Set<string>();
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(
-      `BookmarkFoldersSlice API returned ${response.status}.\n` +
-        `Response: ${text.slice(0, 300)}\n\n` +
-        (response.status === 401 || response.status === 403
-          ? 'Fix: Your X session may have expired. Open your browser, log into x.com, and retry.'
-          : 'This may be a temporary issue. Try again in a few minutes.')
-    );
+  for (let page = 0; page < 100; page++) {
+    const response = await fetch(buildFoldersListUrl(cursor), {
+      headers: buildHeaders(csrfToken, cookieHeader),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `BookmarkFoldersSlice API returned ${response.status}.\n` +
+          `Response: ${text.slice(0, 300)}\n\n` +
+          (response.status === 401 || response.status === 403
+            ? 'Fix: Your X session may have expired. Open your browser, log into x.com, and retry.'
+            : 'This may be a temporary issue. Try again in a few minutes.')
+      );
+    }
+
+    const json = await response.json();
+    // Try the known response paths in order (X has used a few shapes).
+    const slice =
+      json?.data?.viewer?.user_results?.result?.bookmark_collections_slice ??
+      json?.data?.viewer?.bookmark_collections_slice ??
+      json?.data?.bookmark_collections_slice;
+    const items: any[] = slice?.items ?? [];
+
+    for (const item of items) {
+      const id = String(item.id ?? item.rest_id ?? '');
+      const name = String(item.name ?? '');
+      if (!id || !name || seenIds.has(id)) continue;
+      seenIds.add(id);
+      folders.push({ id, name });
+    }
+
+    const nextCursor =
+      typeof slice?.slice_info?.next_cursor === 'string'
+        ? slice.slice_info.next_cursor
+        : undefined;
+    if (!nextCursor || seenCursors.has(nextCursor)) break;
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
   }
 
-  const json = await response.json();
-  // Try the known response paths in order (X has used a few shapes).
-  const items: any[] =
-    json?.data?.viewer?.user_results?.result?.bookmark_collections_slice?.items ??
-    json?.data?.viewer?.bookmark_collections_slice?.items ??
-    json?.data?.bookmark_collections_slice?.items ??
-    [];
-
-  return items
-    .map((item: any) => ({
-      id: String(item.id ?? item.rest_id ?? ''),
-      name: String(item.name ?? ''),
-    }))
-    .filter((f) => f.id && f.name);
+  return folders;
 }
 
 export function parseFolderTimelineResponse(json: any, now?: string): PageResult {

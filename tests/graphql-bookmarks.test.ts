@@ -17,6 +17,7 @@ import {
   mergeRecords,
   applyFolderMirror,
   clearFolderEverywhere,
+  fetchBookmarkFolders,
   formatSyncResult,
   syncBookmarksGraphQL,
   syncGaps,
@@ -1408,6 +1409,58 @@ test('formatSyncResult: formats all fields', () => {
 
 const CODING_FOLDER: BookmarkFolder = { id: 'f-coding', name: 'Coding' };
 const AI_FOLDER: BookmarkFolder = { id: 'f-ai', name: 'AI Research' };
+
+test('fetchBookmarkFolders: follows BookmarkFoldersSlice pagination', async () => {
+  const originalFetch = globalThis.fetch;
+  const requestedVariables: any[] = [];
+  let call = 0;
+
+  globalThis.fetch = (async (url) => {
+    call += 1;
+    const parsedUrl = new URL(String(url));
+    requestedVariables.push(JSON.parse(parsedUrl.searchParams.get('variables') ?? '{}'));
+
+    const slice = call === 1
+      ? {
+          items: [
+            { id: 'folder-1', name: 'Folder One' },
+            { id: 'folder-2', name: 'Folder Two' },
+          ],
+          slice_info: { next_cursor: 'cursor-1' },
+        }
+      : {
+          items: [
+            { id: 'folder-3', name: 'Folder Three' },
+          ],
+          slice_info: {},
+        };
+
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          user_results: {
+            result: {
+              bookmark_collections_slice: slice,
+            },
+          },
+        },
+      },
+    }), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const folders = await fetchBookmarkFolders('csrf-token', 'ct0=csrf-token; auth_token=secret');
+
+    assert.deepEqual(requestedVariables, [{}, { cursor: 'cursor-1' }]);
+    assert.deepEqual(folders, [
+      { id: 'folder-1', name: 'Folder One' },
+      { id: 'folder-2', name: 'Folder Two' },
+      { id: 'folder-3', name: 'Folder Three' },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test('parseFolderTimelineResponse: parses bookmark_collection_timeline shape', () => {
   const tr = makeTweetResult();
