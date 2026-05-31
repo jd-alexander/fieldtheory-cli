@@ -2721,6 +2721,13 @@ test('resolveBookmarkFolderTargets: dedupes repeated folder names', () => {
   assert.deepEqual(resolved.map((folder) => folder.id), ['f1']);
 });
 
+test('resolveBookmarkFolderTargets: resolves selected folder ids in request order', () => {
+  const resolved = resolveBookmarkFolderTargets(FOLDERS, {
+    onlyFolderIds: ['f4', 'f1', 'f4'],
+  });
+  assert.deepEqual(resolved.map((folder) => folder.id), ['f4', 'f1']);
+});
+
 test('resolveBookmarkFolderTargets: defaults to all folders when no filter is set', () => {
   assert.deepEqual(resolveBookmarkFolderTargets(FOLDERS).map((folder) => folder.id), ['f1', 'f2', 'f3', 'f4']);
 });

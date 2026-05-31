@@ -635,6 +635,7 @@ export function mergeBookmarkRecord(existing: BookmarkRecord | undefined, incomi
   if ((existing.folderIds?.length ?? 0) > 0 && (incoming.folderIds?.length ?? 0) === 0) {
     merged.folderIds = existing.folderIds;
     merged.folderNames = existing.folderNames;
+    merged.folderSortIndices = existing.folderSortIndices;
   }
 
   return merged;
@@ -1217,14 +1218,22 @@ function withoutFolder(record: BookmarkRecord, folderId: string): BookmarkRecord
   const oldIds = record.folderIds ?? [];
   if (!oldIds.includes(folderId)) return record;
   const oldNames = record.folderNames ?? [];
+  const oldSortIndices = record.folderSortIndices ?? [];
   const newIds: string[] = [];
   const newNames: string[] = [];
+  const newSortIndices: Array<string | null> = [];
   for (let i = 0; i < oldIds.length; i++) {
     if (oldIds[i] === folderId) continue;
     newIds.push(oldIds[i]);
     newNames.push(oldNames[i] ?? '');
+    newSortIndices.push(oldSortIndices[i] ?? null);
   }
-  return { ...record, folderIds: newIds, folderNames: newNames };
+  return {
+    ...record,
+    folderIds: newIds,
+    folderNames: newNames,
+    folderSortIndices: newSortIndices.length > 0 ? newSortIndices : undefined,
+  };
 }
 
 /**
@@ -1233,28 +1242,44 @@ function withoutFolder(record: BookmarkRecord, folderId: string): BookmarkRecord
  * corrupt duplicates), then appends a single clean entry with the current
  * display name. Handles folder rename on X as a side effect.
  */
-function withFolder(record: BookmarkRecord, folder: BookmarkFolder): BookmarkRecord {
+function withFolder(
+  record: BookmarkRecord,
+  folder: BookmarkFolder,
+  folderSortIndex: string | null | undefined = record.sortIndex ?? null,
+): BookmarkRecord {
   const oldIds = record.folderIds ?? [];
   const oldNames = record.folderNames ?? [];
+  const oldSortIndices = record.folderSortIndices ?? [];
+  const nextSortIndex = folderSortIndex ?? null;
 
   // Fast path: already tagged exactly once with the current name — no-op.
   const firstIdx = oldIds.indexOf(folder.id);
   const matchCount = oldIds.reduce((n, id) => (id === folder.id ? n + 1 : n), 0);
-  if (matchCount === 1 && oldNames[firstIdx] === folder.name) return record;
+  if (
+    matchCount === 1 &&
+    oldNames[firstIdx] === folder.name &&
+    oldSortIndices.length === oldIds.length &&
+    (oldSortIndices[firstIdx] ?? null) === nextSortIndex
+  ) {
+    return record;
+  }
 
   // Slow path: remove every existing occurrence (defensive against duplicates)
   // and append exactly one clean entry.
   const cleanedIds: string[] = [];
   const cleanedNames: string[] = [];
+  const cleanedSortIndices: Array<string | null> = [];
   for (let i = 0; i < oldIds.length; i++) {
     if (oldIds[i] === folder.id) continue;
     cleanedIds.push(oldIds[i]);
     cleanedNames.push(oldNames[i] ?? '');
+    cleanedSortIndices.push(oldSortIndices[i] ?? null);
   }
   return {
     ...record,
     folderIds: [...cleanedIds, folder.id],
     folderNames: [...cleanedNames, folder.name],
+    folderSortIndices: [...cleanedSortIndices, nextSortIndex],
   };
 }
 
@@ -1299,14 +1324,14 @@ export function applyFolderMirror(
     const prev = byId.get(walked.id);
 
     if (!prev) {
-      byId.set(walked.id, withFolder(walked, folder));
+      byId.set(walked.id, withFolder(walked, folder, walked.sortIndex));
       added += 1;
       continue;
     }
 
     const wasTagged = (prev.folderIds ?? []).includes(folder.id);
     const base = mergeBookmarkRecord(prev, walked);
-    byId.set(walked.id, withFolder(base, folder));
+    byId.set(walked.id, withFolder(base, folder, walked.sortIndex));
     if (wasTagged) unchanged += 1;
     else tagged += 1;
   }
@@ -1346,14 +1371,14 @@ export function applyFolderArchive(
     const prev = byId.get(walked.id);
 
     if (!prev) {
-      byId.set(walked.id, withFolder(walked, folder));
+      byId.set(walked.id, withFolder(walked, folder, walked.sortIndex));
       added += 1;
       continue;
     }
 
     const wasTagged = (prev.folderIds ?? []).includes(folder.id);
     const base = mergeBookmarkRecord(prev, walked);
-    byId.set(walked.id, withFolder(base, folder));
+    byId.set(walked.id, withFolder(base, folder, walked.sortIndex));
     if (wasTagged) unchanged += 1;
     else tagged += 1;
   }
@@ -1389,6 +1414,8 @@ export interface FolderSyncOptions {
   firefoxProfileDir?: string;
   /** If set, sync only the folder with this id (resolved ahead of time). */
   onlyFolderId?: string;
+  /** If set, sync only the folders with these ids. */
+  onlyFolderIds?: string[];
   /**
    * If set, sync only the folder matching this display name.
    * Resolved against the fetched folder list (case-insensitive
@@ -1447,17 +1474,29 @@ function resolveBookmarkFolderByName(allFolders: BookmarkFolder[], query: string
 
 export function resolveBookmarkFolderTargets(
   allFolders: BookmarkFolder[],
-  options: Pick<FolderSyncOptions, 'onlyFolderId' | 'onlyFolderName' | 'onlyFolderNames'> = {},
+  options: Pick<FolderSyncOptions, 'onlyFolderId' | 'onlyFolderIds' | 'onlyFolderName' | 'onlyFolderNames'> = {},
 ): BookmarkFolder[] {
-  if (options.onlyFolderId) {
-    const match = allFolders.find((f) => f.id === options.onlyFolderId);
-    if (!match) {
-      throw new Error(
-        `Folder "${options.onlyFolderName ?? options.onlyFolderId}" not found on X. ` +
-          `Available: ${allFolders.map((f) => f.name).join(', ') || '(none)'}`
-      );
+  const requestedIds = [
+    ...(options.onlyFolderId ? [options.onlyFolderId] : []),
+    ...(options.onlyFolderIds ?? []),
+  ].map((id) => id.trim()).filter(Boolean);
+
+  if (requestedIds.length > 0) {
+    const seenIds = new Set<string>();
+    const resolved: BookmarkFolder[] = [];
+    for (const folderId of requestedIds) {
+      const match = allFolders.find((f) => f.id === folderId);
+      if (!match) {
+        throw new Error(
+          `Folder id "${folderId}" not found on X. ` +
+            `Available: ${allFolders.map((f) => `${f.name} (${f.id})`).join(', ') || '(none)'}`
+        );
+      }
+      if (seenIds.has(match.id)) continue;
+      seenIds.add(match.id);
+      resolved.push(match);
     }
-    return [match];
+    return resolved;
   }
 
   const requestedNames = [
@@ -1731,7 +1770,13 @@ export async function syncBookmarkFolders(
   // full folder sync. Daily archive sync preserves tags for folders that
   // disappear from X until the user intentionally prunes them.
   const orphanFoldersCleared: Array<{ folderId: string; recordsAffected: number }> = [];
-  if (options.pruneMissingFolderTags && !options.onlyFolderId && !options.onlyFolderName && !options.onlyFolderNames?.length) {
+  if (
+    options.pruneMissingFolderTags &&
+    !options.onlyFolderId &&
+    !options.onlyFolderIds?.length &&
+    !options.onlyFolderName &&
+    !options.onlyFolderNames?.length
+  ) {
     const currentFolderIds = new Set(allFolders.map((f) => f.id));
     const knownTaggedIds = new Set<string>();
     for (const r of existing) {

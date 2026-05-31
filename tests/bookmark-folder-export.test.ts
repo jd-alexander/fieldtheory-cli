@@ -106,7 +106,7 @@ test('exportReadableBookmarkArchive writes folder directories, tweet markdown, a
 
     const folderIndex = await readFile(path.join(folderDir, 'README.md'), 'utf8');
     assert.match(folderIndex, /Record hash: `hash-1`/);
-    assert.match(folderIndex, /\| 2026-05-29 \| @example \|/);
+    assert.match(folderIndex, /\| 1 \| 2026-05-29 \| @example \|/);
 
     const rootIndex = await readFile(path.join(dir, 'readable', 'README.md'), 'utf8');
     assert.match(rootIndex, /\[App Store Screenshots\]\(folders\/001 - App Store Screenshots\/README\.md\)/);
@@ -126,7 +126,7 @@ test('exportReadableBookmarkArchive clean removes stale generated files', async 
   });
 });
 
-test('exportReadableBookmarkArchive sorts folder README entries by tweet date newest first', async () => {
+test('exportReadableBookmarkArchive sorts and names folder entries by tweet date newest first', async () => {
   await withIsolatedDataDir(async (dir) => {
     const records = [
       {
@@ -140,6 +140,7 @@ test('exportReadableBookmarkArchive sorts folder README entries by tweet date ne
         sortIndex: '999',
         folderIds: ['f-ads'],
         folderNames: ['Ads'],
+        folderSortIndices: ['999'],
         tags: [],
         ingestedVia: 'graphql',
       },
@@ -154,6 +155,7 @@ test('exportReadableBookmarkArchive sorts folder README entries by tweet date ne
         sortIndex: '1',
         folderIds: ['f-ads'],
         folderNames: ['Ads'],
+        folderSortIndices: ['001'],
         tags: [],
         ingestedVia: 'graphql',
       },
@@ -168,8 +170,13 @@ test('exportReadableBookmarkArchive sorts folder README entries by tweet date ne
     const folderIndex = await readFile(path.join(dir, 'readable', 'folders', '001 - Ads', 'README.md'), 'utf8');
     assert.ok(
       folderIndex.indexOf('Newer bookmark') < folderIndex.indexOf('Older bookmark'),
-      'newer tweets should appear before older tweets even when sortIndex points the other way',
+      'README order should put newer tweet dates before older tweet dates even when X folder sort index points the other way',
     );
+    const files = (await readdir(path.join(dir, 'readable', 'folders', '001 - Ads')))
+      .filter((file) => file.endsWith('.md') && file !== 'README.md')
+      .sort();
+    assert.match(files[0], /^0001 - .*new\.md$/);
+    assert.match(files[1], /^0002 - .*old\.md$/);
   });
 });
 

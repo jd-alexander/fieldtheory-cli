@@ -103,14 +103,35 @@ function compareRecordsForArchive(a: BookmarkRecord, b: BookmarkRecord): number 
   return b.tweetId.localeCompare(a.tweetId);
 }
 
+function folderSortIndex(record: BookmarkRecord, folderId: string): string | null {
+  const index = record.folderIds?.indexOf(folderId) ?? -1;
+  if (index < 0) return null;
+  return record.folderSortIndices?.[index] ?? record.sortIndex ?? null;
+}
+
+function compareRecordsForFolder(folderId: string, a: BookmarkRecord, b: BookmarkRecord): number {
+  const aTime = parseTimestampMs(a.postedAt) ?? parseTimestampMs(a.bookmarkedAt) ?? 0;
+  const bTime = parseTimestampMs(b.postedAt) ?? parseTimestampMs(b.bookmarkedAt) ?? 0;
+  if (aTime !== bTime) return bTime - aTime;
+
+  const sortIndex = compareSortIndexDesc(folderSortIndex(a, folderId), folderSortIndex(b, folderId));
+  if (sortIndex !== 0) return sortIndex;
+
+  const globalSortIndex = compareSortIndexDesc(a.sortIndex, b.sortIndex);
+  if (globalSortIndex !== 0) return globalSortIndex;
+
+  return b.tweetId.localeCompare(a.tweetId);
+}
+
 function fileDate(record: BookmarkRecord): string {
   return toIsoDate(record.postedAt ?? record.bookmarkedAt) ?? 'undated';
 }
 
-function bookmarkFileName(record: BookmarkRecord): string {
+function bookmarkFileName(record: BookmarkRecord, position: number): string {
+  const prefix = String(position).padStart(4, '0');
   const author = record.authorHandle ? slug(record.authorHandle) : 'unknown';
   const textPart = slug(record.text.slice(0, 48)) || 'bookmark';
-  return `${fileDate(record)}-${author}-${textPart}-${record.tweetId}.md`;
+  return `${prefix} - ${fileDate(record)}-${author}-${textPart}-${record.tweetId}.md`;
 }
 
 function tableCell(value: string): string {
@@ -417,7 +438,7 @@ function buildArchiveFolders(
       lastSyncedAt: folder.lastSyncedAt,
       recordCount: folder.recordCount,
       recordIdsHash: folder.recordIdsHash,
-      records: [...folderRecords].sort(compareRecordsForArchive),
+      records: [...folderRecords].sort((a, b) => compareRecordsForFolder(folder.id, a, b)),
     });
     usedIds.add(folder.id);
   }
@@ -429,7 +450,7 @@ function buildArchiveFolders(
       name: cleanFolderName(knownNamesById.get(id), id),
       order: folders.length + 1,
       active: true,
-      records: [...(recordsByFolderId.get(id) ?? [])].sort(compareRecordsForArchive),
+      records: [...(recordsByFolderId.get(id) ?? [])].sort((a, b) => compareRecordsForFolder(id, a, b)),
     });
   }
 
@@ -459,16 +480,17 @@ function folderIndexMarkdown(folder: ArchiveFolder, folderReadmePath: string, fi
   if (folder.recordIdsHash) lines.push(`- Record hash: \`${folder.recordIdsHash}\``);
   lines.push('');
 
-  lines.push('| Date | Author | Bookmark | Media | Article |');
-  lines.push('| --- | --- | --- | ---: | --- |');
-  for (const record of folder.records) {
+  lines.push('| # | Date | Author | Bookmark | Media | Article |');
+  lines.push('| ---: | --- | --- | --- | ---: | --- |');
+  for (let index = 0; index < folder.records.length; index++) {
+    const record = folder.records[index];
     const filePath = fileByRecordId.get(record.id);
     const rel = filePath ? relativeMarkdownLink(folderReadmePath, filePath) : '';
     const label = tableCell(oneLine(record.text).slice(0, 90) || record.tweetId);
     const title = rel ? `[${label}](${rel})` : label;
     const mediaCount = (record.mediaObjects?.length ?? record.media?.length ?? 0);
     const article = hasArticleContent(record) || (record.quotedTweet ? hasArticleContent(record.quotedTweet) : false) ? 'yes' : '';
-    lines.push(`| ${fileDate(record)} | ${tableCell(record.authorHandle ? `@${record.authorHandle}` : 'Unknown')} | ${title} | ${mediaCount} | ${article} |`);
+    lines.push(`| ${index + 1} | ${fileDate(record)} | ${tableCell(record.authorHandle ? `@${record.authorHandle}` : 'Unknown')} | ${title} | ${mediaCount} | ${article} |`);
   }
   lines.push('');
   return lines.join('\n');
@@ -516,8 +538,9 @@ export async function exportReadableBookmarkArchive(
     const fileByRecordId = new Map<string, string>();
 
     progress(`Exporting ${folder.name} (${folder.records.length})...`);
-    for (const record of folder.records) {
-      const filePath = path.join(dir, bookmarkFileName(record));
+    for (let index = 0; index < folder.records.length; index++) {
+      const record = folder.records[index];
+      const filePath = path.join(dir, bookmarkFileName(record, index + 1));
       fileByRecordId.set(record.id, filePath);
       await writeMd(filePath, renderBookmarkMarkdown(record, folder, filePath, mediaByTweetId));
       filesWritten++;

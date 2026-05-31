@@ -275,6 +275,12 @@ function formatFolderRetryCommand(folderNames: string[]): string {
   return `ft sync ${args}`;
 }
 
+function formatFolderIdRetryCommand(folderIds: string[]): string {
+  if (folderIds.length === 0) return 'ft sync --folders';
+  const args = folderIds.map((id) => `--folder-id ${JSON.stringify(id)}`).join(' ');
+  return `ft sync ${args}`;
+}
+
 function addHttpSafetyOptions(command: Command): Command {
   return command
     .option('--audit-http', 'Write redacted HTTP request/response metadata to logs/http-audit-YYYY-MM-DD.jsonl')
@@ -501,6 +507,7 @@ const WHATS_NEW: Record<string, string[]> = {
   '1.3.5': [
     'ft sync --folders \u2014 sync X bookmark folder tags without removing historical captures',
     'ft sync --folder <name> \u2014 sync a single folder by name',
+    'ft sync --folder-id <id> \u2014 sync a single folder by X folder id',
     'ft list --folder <name> \u2014 filter bookmarks by folder',
     'ft folders \u2014 show folder distribution',
     'Security: SSRF fix in article enrichment (redirect chains now validated per hop)',
@@ -936,6 +943,11 @@ export function buildCli() {
       'Sync only this folder; repeat for a selected batch (case-insensitive, supports unambiguous prefix)',
       collectOptionValue,
     )
+    .option(
+      '--folder-id <id>',
+      'Sync only this folder id; repeat for a selected batch, including duplicate-name folders',
+      collectOptionValue,
+    )
     .option('--prune-folder-tags', 'Remove folder tags that are missing from a complete X folder walk', false)
     .option('--threads', 'Capture parent context and same-author thread continuations', false)
     .addOption(engineOption()))
@@ -963,15 +975,17 @@ export function buildCli() {
           return;
         }
 
-        // Folder flags: --folders (all) and --folder <name> (selected batch) are mutually exclusive.
+        // Folder flags: --folders (all), --folder <name>, and --folder-id <id> are mutually exclusive.
         const folderAll = Boolean(options.folders);
         const folderNames = normalizeOptionStrings(options.folder);
-        if (folderAll && folderNames.length > 0) {
-          console.error('  Error: --folders and --folder cannot be used together. Pick one.');
+        const folderIds = normalizeOptionStrings(options.folderId);
+        const folderSelectors = [folderAll, folderNames.length > 0, folderIds.length > 0].filter(Boolean).length;
+        if (folderSelectors > 1) {
+          console.error('  Error: --folders, --folder, and --folder-id cannot be combined. Pick one.');
           process.exitCode = 1;
           return;
         }
-        const folderMode: 'off' | 'all' | 'selected' = folderNames.length > 0 ? 'selected' : folderAll ? 'all' : 'off';
+        const folderMode: 'off' | 'all' | 'selected' | 'ids' = folderIds.length > 0 ? 'ids' : folderNames.length > 0 ? 'selected' : folderAll ? 'all' : 'off';
         if (folderMode !== 'off' && options.api) {
           console.error('  Error: Folder sync requires browser session (GraphQL). Remove --api.');
           process.exitCode = 1;
@@ -983,7 +997,7 @@ export function buildCli() {
           return;
         }
         if (folderMode !== 'off' && options.gaps) {
-          console.error('  Error: --folders/--folder cannot be combined with --gaps. Run them separately.');
+          console.error('  Error: --folders/--folder/--folder-id cannot be combined with --gaps. Run them separately.');
           process.exitCode = 1;
           return;
         }
@@ -1283,6 +1297,7 @@ export function buildCli() {
                 firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
                 delayMs: folderDelayMs,
                 onlyFolderNames: folderMode === 'selected' ? folderNames : undefined,
+                onlyFolderIds: folderMode === 'ids' ? folderIds : undefined,
                 pruneMissingFolderTags: Boolean(options.pruneFolderTags),
                 onProgress: (status: FolderSyncProgress) => {
                   if (status.phase === 'walking' && status.folder) {
@@ -1307,7 +1322,11 @@ export function buildCli() {
                 for (const { folder, reason } of folderResult.skippedFolders) {
                   console.log(`  \u26a0 Skipped ${sanitizeForDisplay(folder.name)}: ${reason}`);
                 }
-                const retryCmd = folderMode === 'selected' ? formatFolderRetryCommand(folderNames) : `ft sync --folders`;
+                const retryCmd = folderMode === 'selected'
+                  ? formatFolderRetryCommand(folderNames)
+                  : folderMode === 'ids'
+                    ? formatFolderIdRetryCommand(folderIds)
+                    : `ft sync --folders`;
                 console.log(`  Re-run \`${retryCmd}\` to retry.`);
               }
 

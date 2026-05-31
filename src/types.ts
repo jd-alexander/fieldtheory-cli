@@ -163,6 +163,12 @@ export interface BookmarkRecord {
   folderIds?: string[];
   folderNames?: string[];
   /**
+   * Parallel to folderIds/folderNames. Stores X's opaque per-folder timeline
+   * ordering key so each readable folder can keep X's placement as a stable
+   * tiebreaker, even when a tweet appears in multiple folders.
+   */
+  folderSortIndices?: Array<string | null>;
+  /**
    * Set once `ft sync --gaps` has attempted to expand long-form text for this
    * record. Present regardless of whether expansion actually lengthened the
    * stored text — its purpose is to keep the gap-fill selector idempotent so
