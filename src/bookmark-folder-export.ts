@@ -177,7 +177,7 @@ function renderMediaMarkdown(
   remoteUrls: string[],
 ): string[] {
   const lines: string[] = [];
-  const localSourceUrls = new Set(localEntries.map((entry) => entry.sourceUrl));
+  const localSourceUrls = new Set(localEntries.flatMap((entry) => mediaCoverageKeys(entry.sourceUrl)));
   const seenLocal = new Set<string>();
   for (const entry of localEntries) {
     if (!entry.localPath || seenLocal.has(entry.localPath)) continue;
@@ -191,7 +191,9 @@ function renderMediaMarkdown(
     }
   }
 
-  const missingRemote = [...new Set(remoteUrls)].filter((url) => !localSourceUrls.has(url));
+  const missingRemote = [...new Set(remoteUrls)].filter((url) =>
+    !mediaCoverageKeys(url).some((key) => localSourceUrls.has(key))
+  );
   if (missingRemote.length > 0) {
     lines.push('');
     lines.push('Remote media not downloaded yet:');
@@ -199,6 +201,18 @@ function renderMediaMarkdown(
   }
 
   return lines.filter((line, index, arr) => !(line === '' && arr[index - 1] === ''));
+}
+
+function mediaCoverageKeys(sourceUrl: string): string[] {
+  const keys = [sourceUrl];
+  try {
+    const parsed = new URL(sourceUrl);
+    if (parsed.hostname === 'pbs.twimg.com' && parsed.pathname.startsWith('/media/')) {
+      parsed.search = '';
+      keys.push(parsed.toString());
+    }
+  } catch {}
+  return [...new Set(keys)];
 }
 
 function renderTweetSnapshot(

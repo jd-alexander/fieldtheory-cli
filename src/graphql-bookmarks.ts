@@ -2748,8 +2748,10 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
     recordsByXArticleTweetId.set(r.tweetId, list);
   }
 
-  // Combine all IDs to fetch — deduplicated
-  const allFetchIds = [...new Set([...quotedIds, ...truncatedIds, ...xArticleIds])];
+  // Combine all IDs to fetch — deduplicated. X Articles are prioritized
+  // because they otherwise look like empty link-only tweets in the readable
+  // archive until the authenticated article payload is fetched.
+  const allFetchIds = [...new Set([...xArticleIds, ...quotedIds, ...truncatedIds])];
   const total = allFetchIds.length;
 
   let quotedFetched = 0;

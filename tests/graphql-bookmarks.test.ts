@@ -940,6 +940,58 @@ test('syncGaps: reports X Article when fallback only returns tweet preview', asy
   }, [xArticle]);
 });
 
+test('syncGaps: prioritizes X Article enrichment before other gap work', async () => {
+  const quotedMissing: BookmarkRecord = {
+    id: 'quoted-parent',
+    tweetId: 'quoted-parent',
+    url: 'https://x.com/alice/status/quoted-parent',
+    text: 'Quoting a missing tweet',
+    quotedStatusId: 'quoted-target',
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+  const truncated: BookmarkRecord = {
+    id: 'truncated',
+    tweetId: 'truncated',
+    url: 'https://x.com/alice/status/truncated',
+    text: 'x'.repeat(320),
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+  const xArticle: BookmarkRecord = {
+    id: 'article-tweet',
+    tweetId: 'article-tweet',
+    url: 'https://x.com/alice/status/article-tweet',
+    text: 'https://x.com/i/article/article-id',
+    links: ['https://x.com/i/article/article-id'],
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+
+  await withIsolatedGapFillDataDir(async () => {
+    await buildIndex();
+    const calls: string[] = [];
+    await syncGaps({
+      tweetFetcher: async (tweetId) => {
+        calls.push(tweetId);
+        return {
+          snapshot: { id: tweetId, text: 'preview', url: `https://x.com/alice/status/${tweetId}` },
+          article: tweetId === 'article-tweet'
+            ? { title: 'Article', text: 'Article body from X Article payload' }
+            : undefined,
+          status: 'ok',
+          source: 'graphql',
+        };
+      },
+    });
+
+    assert.equal(calls[0], 'article-tweet');
+  }, [quotedMissing, truncated, xArticle]);
+});
+
 async function withIsolatedGapFillDataDir(
   fn: () => Promise<void>,
   fixtures: BookmarkRecord[],
