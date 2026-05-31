@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { ensureDir, readJsonLines, writeJsonLines, readJson, writeJson, pathExists } from './fs.js';
-import { ensureDataDir, twitterBookmarksCachePath, twitterBookmarksMetaPath, twitterBackfillStatePath } from './paths.js';
+import { ensureDataDir, twitterBookmarkFoldersStatePath, twitterBookmarksCachePath, twitterBookmarksMetaPath, twitterBackfillStatePath } from './paths.js';
 import { loadChromeSessionConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
 import { extractFirefoxXCookies } from './firefox-cookies.js';
@@ -1361,6 +1362,129 @@ export interface FolderSyncResult {
   orphanFoldersCleared: Array<{ folderId: string; recordsAffected: number }>;
 }
 
+export interface BookmarkFolderStateEntry {
+  id: string;
+  name: string;
+  order: number | null;
+  active: boolean;
+  lastListedAt?: string;
+  missingSince?: string;
+  lastSyncedAt?: string;
+  recordCount?: number;
+  recordIdsHash?: string;
+  lastStats?: FolderMirrorStats;
+  lastSkippedAt?: string;
+  lastSkippedReason?: string;
+}
+
+export interface BookmarkFolderSyncState {
+  schemaVersion: 1;
+  updatedAt: string;
+  folderCount: number;
+  folders: BookmarkFolderStateEntry[];
+  orphanFoldersCleared?: Array<{ folderId: string; recordsAffected: number; clearedAt: string }>;
+}
+
+export function hashFolderRecordIds(records: BookmarkRecord[]): string {
+  const ids = records.map((record) => record.id).sort();
+  return createHash('sha256').update(ids.join('\n')).digest('hex');
+}
+
+async function loadFolderSyncState(statePath = twitterBookmarkFoldersStatePath()): Promise<BookmarkFolderSyncState | undefined> {
+  if (!(await pathExists(statePath))) return undefined;
+  try {
+    return await readJson<BookmarkFolderSyncState>(statePath);
+  } catch {
+    return undefined;
+  }
+}
+
+export function mergeFolderInventoryState(
+  previous: BookmarkFolderSyncState | undefined,
+  folders: BookmarkFolder[],
+  listedAt: string,
+): BookmarkFolderSyncState {
+  const previousById = new Map((previous?.folders ?? []).map((folder) => [folder.id, folder]));
+  const currentIds = new Set(folders.map((folder) => folder.id));
+  const entries: BookmarkFolderStateEntry[] = folders.map((folder, index) => {
+    const prev = previousById.get(folder.id);
+    return {
+      ...prev,
+      id: folder.id,
+      name: folder.name,
+      order: index + 1,
+      active: true,
+      lastListedAt: listedAt,
+      missingSince: undefined,
+    };
+  });
+
+  for (const prev of previous?.folders ?? []) {
+    if (currentIds.has(prev.id)) continue;
+    entries.push({
+      ...prev,
+      order: null,
+      active: false,
+      missingSince: prev.missingSince ?? listedAt,
+    });
+  }
+
+  return {
+    schemaVersion: 1,
+    updatedAt: listedAt,
+    folderCount: folders.length,
+    folders: entries,
+    orphanFoldersCleared: previous?.orphanFoldersCleared,
+  };
+}
+
+function updateFolderSyncedState(
+  state: BookmarkFolderSyncState,
+  folder: BookmarkFolder,
+  walkedRecords: BookmarkRecord[],
+  stats: FolderMirrorStats,
+  syncedAt: string,
+): BookmarkFolderSyncState {
+  return {
+    ...state,
+    updatedAt: syncedAt,
+    folders: state.folders.map((entry) => entry.id === folder.id
+      ? {
+          ...entry,
+          name: folder.name,
+          active: true,
+          lastSyncedAt: syncedAt,
+          recordCount: walkedRecords.length,
+          recordIdsHash: hashFolderRecordIds(walkedRecords),
+          lastStats: stats,
+          lastSkippedAt: undefined,
+          lastSkippedReason: undefined,
+        }
+      : entry),
+  };
+}
+
+function updateFolderSkippedState(
+  state: BookmarkFolderSyncState,
+  folder: BookmarkFolder,
+  reason: string,
+  skippedAt: string,
+): BookmarkFolderSyncState {
+  return {
+    ...state,
+    updatedAt: skippedAt,
+    folders: state.folders.map((entry) => entry.id === folder.id
+      ? {
+          ...entry,
+          name: folder.name,
+          active: true,
+          lastSkippedAt: skippedAt,
+          lastSkippedReason: reason,
+        }
+      : entry),
+  };
+}
+
 async function resolveFolderSyncCookies(
   options: FolderSyncOptions,
 ): Promise<{ csrfToken: string; cookieHeader?: string }> {
@@ -1411,11 +1535,15 @@ export async function syncBookmarkFolders(
   ensureDataDir();
   const cachePath = twitterBookmarksCachePath();
   const metaPath = twitterBookmarksMetaPath();
+  const folderStatePath = twitterBookmarkFoldersStatePath();
   const loaded = await loadExistingBookmarks();
   let existing = loaded.records;
 
   options.onProgress?.({ phase: 'listing' });
   const allFolders = await fetchBookmarkFolders(csrfToken, cookieHeader);
+  const listedAt = new Date().toISOString();
+  let folderState = mergeFolderInventoryState(await loadFolderSyncState(folderStatePath), allFolders, listedAt);
+  await writeJson(folderStatePath, folderState);
 
   let targetFolders: BookmarkFolder[];
   if (options.onlyFolderId) {
@@ -1461,6 +1589,8 @@ export async function syncBookmarkFolders(
     } catch (err) {
       if (isHttpSafetyStop(err)) throw err;
       const reason = (err as Error).message ?? 'unknown error';
+      folderState = updateFolderSkippedState(folderState, folder, reason, new Date().toISOString());
+      await writeJson(folderStatePath, folderState);
       skippedFolders.push({ folder, reason });
       perFolder.push({ folder, stats: null, skipped: reason });
       continue;
@@ -1468,6 +1598,8 @@ export async function syncBookmarkFolders(
 
     if (!walkResult.complete) {
       const reason = 'incomplete walk (hit page limit)';
+      folderState = updateFolderSkippedState(folderState, folder, reason, new Date().toISOString());
+      await writeJson(folderStatePath, folderState);
       skippedFolders.push({ folder, reason });
       perFolder.push({ folder, stats: null, skipped: reason });
       continue;
@@ -1496,6 +1628,8 @@ export async function syncBookmarkFolders(
     // Checkpoint after each successful folder so a crash loses at most one folder's work.
     // Also updates bookmarks-meta.json so `ft status` reflects the new total.
     await persistFolderCheckpoint(cachePath, metaPath, existing);
+    folderState = updateFolderSyncedState(folderState, folder, walkResult.records, mirror.stats, new Date().toISOString());
+    await writeJson(folderStatePath, folderState);
 
     if (i < targetFolders.length - 1) {
       await new Promise((r) => setTimeout(r, Math.max(delayMs, 1000)));
@@ -1518,6 +1652,16 @@ export async function syncBookmarkFolders(
     }
     if (orphanFoldersCleared.length > 0) {
       await persistFolderCheckpoint(cachePath, metaPath, existing);
+      const clearedAt = new Date().toISOString();
+      folderState = {
+        ...folderState,
+        updatedAt: clearedAt,
+        orphanFoldersCleared: [
+          ...(folderState.orphanFoldersCleared ?? []),
+          ...orphanFoldersCleared.map((entry) => ({ ...entry, clearedAt })),
+        ],
+      };
+      await writeJson(folderStatePath, folderState);
     }
   }
 

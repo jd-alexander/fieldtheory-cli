@@ -21,6 +21,8 @@ import {
   clearFolderEverywhere,
   fetchBookmarkFolders,
   formatSyncResult,
+  hashFolderRecordIds,
+  mergeFolderInventoryState,
   syncBookmarksGraphQL,
   syncGaps,
   syncThreads,
@@ -2011,6 +2013,71 @@ test('formatSyncResult: formats all fields', () => {
 
 const CODING_FOLDER: BookmarkFolder = { id: 'f-coding', name: 'Coding' };
 const AI_FOLDER: BookmarkFolder = { id: 'f-ai', name: 'AI Research' };
+
+test('hashFolderRecordIds is stable across folder timeline order', () => {
+  const a = makeRecord({ id: '1', tweetId: '1', text: 'one' });
+  const b = makeRecord({ id: '2', tweetId: '2', text: 'two' });
+
+  assert.equal(hashFolderRecordIds([a, b]), hashFolderRecordIds([b, a]));
+  assert.notEqual(hashFolderRecordIds([a]), hashFolderRecordIds([a, b]));
+});
+
+test('mergeFolderInventoryState preserves sync metadata and marks missing folders inactive', () => {
+  const previous = mergeFolderInventoryState(undefined, [
+    { id: 'folder-1', name: 'Folder One' },
+    { id: 'folder-2', name: 'Folder Two' },
+  ], '2026-05-01T00:00:00.000Z');
+  previous.folders[1].lastSyncedAt = '2026-05-02T00:00:00.000Z';
+  previous.folders[1].recordCount = 12;
+  previous.folders[1].recordIdsHash = 'abc123';
+
+  const next = mergeFolderInventoryState(previous, [
+    { id: 'folder-2', name: 'Folder Two Renamed' },
+    { id: 'folder-3', name: 'Folder Three' },
+  ], '2026-05-03T00:00:00.000Z');
+
+  assert.deepEqual(next.folders.map((folder) => ({
+    id: folder.id,
+    name: folder.name,
+    order: folder.order,
+    active: folder.active,
+    lastSyncedAt: folder.lastSyncedAt,
+    recordCount: folder.recordCount,
+    recordIdsHash: folder.recordIdsHash,
+    missingSince: folder.missingSince,
+  })), [
+    {
+      id: 'folder-2',
+      name: 'Folder Two Renamed',
+      order: 1,
+      active: true,
+      lastSyncedAt: '2026-05-02T00:00:00.000Z',
+      recordCount: 12,
+      recordIdsHash: 'abc123',
+      missingSince: undefined,
+    },
+    {
+      id: 'folder-3',
+      name: 'Folder Three',
+      order: 2,
+      active: true,
+      lastSyncedAt: undefined,
+      recordCount: undefined,
+      recordIdsHash: undefined,
+      missingSince: undefined,
+    },
+    {
+      id: 'folder-1',
+      name: 'Folder One',
+      order: null,
+      active: false,
+      lastSyncedAt: undefined,
+      recordCount: undefined,
+      recordIdsHash: undefined,
+      missingSince: '2026-05-03T00:00:00.000Z',
+    },
+  ]);
+});
 
 test('fetchBookmarkFolders: follows BookmarkFoldersSlice pagination', async () => {
   const originalFetch = globalThis.fetch;
