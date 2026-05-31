@@ -126,6 +126,63 @@ test('fetchBookmarkMediaBatch applies requested photo quality to pbs media URLs'
   }
 });
 
+test('fetchBookmarkMediaBatch filters candidates by folder name', async () => {
+  const adsPhotoUrl = 'https://pbs.twimg.com/media/ads.jpg';
+  const otherPhotoUrl = 'https://pbs.twimg.com/media/other.jpg';
+  const records = [
+    {
+      id: 'ads',
+      tweetId: 'ads',
+      url: 'https://x.com/alice/status/ads',
+      text: 'ads media',
+      syncedAt: '2026-04-09T00:00:00.000Z',
+      folderNames: ['Ads'],
+      mediaObjects: [{ type: 'photo', url: adsPhotoUrl }],
+      tags: [],
+      ingestedVia: 'graphql',
+    },
+    {
+      id: 'other',
+      tweetId: 'other',
+      url: 'https://x.com/alice/status/other',
+      text: 'other media',
+      syncedAt: '2026-04-09T00:00:00.000Z',
+      folderNames: ['Other'],
+      mediaObjects: [{ type: 'photo', url: otherPhotoUrl }],
+      tags: [],
+      ingestedVia: 'graphql',
+    },
+  ];
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 1024, folderNames: ['ads'] });
+      const downloaded = manifest.entries
+        .filter((entry) => entry.status === 'downloaded')
+        .map((entry) => entry.sourceUrl);
+
+      assert.deepEqual(downloaded, [adsPhotoUrl]);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('fetchBookmarkMediaBatch downloads X Article cover and inline images', async () => {
   const coverUrl = 'https://pbs.twimg.com/media/article-cover.jpg';
   const inlineUrl = 'https://pbs.twimg.com/media/article-inline.jpg';
@@ -183,6 +240,8 @@ test('fetchBookmarkMediaBatch downloads quoted tweet media targets', async () =>
   const quotedPosterUrl = 'https://pbs.twimg.com/amplify_video_thumb/quoted.jpg';
   const quotedVideoUrl = 'https://video.twimg.com/ext_tw_video/quoted.mp4';
   const quotedProfileUrl = 'https://pbs.twimg.com/profile_images/456/quoted_normal.jpg';
+  const quotedArticleCoverUrl = 'https://pbs.twimg.com/media/quoted-article-cover.jpg';
+  const quotedArticleInlineUrl = 'https://pbs.twimg.com/media/quoted-article-inline.jpg';
   const records = [{
     id: '1',
     tweetId: '1',
@@ -204,6 +263,8 @@ test('fetchBookmarkMediaBatch downloads quoted tweet media targets', async () =>
         { type: 'photo', url: quotedPhotoUrl },
         { type: 'video', url: quotedPosterUrl, videoVariants: [{ url: quotedVideoUrl, bitrate: 832000 }] },
       ],
+      articleCoverMedia: { media_info: { original_img_url: quotedArticleCoverUrl } },
+      articleMediaEntities: [{ media_info: { original_img_url: quotedArticleInlineUrl } }],
     },
     links: [],
     tags: [],
@@ -235,12 +296,15 @@ test('fetchBookmarkMediaBatch downloads quoted tweet media targets', async () =>
         .map((entry) => ({ tweetId: entry.tweetId, sourceUrl: entry.sourceUrl }))
         .sort((a, b) => a.sourceUrl.localeCompare(b.sourceUrl));
 
-      assert.deepEqual(downloaded, [
+      const expected = [
+        { tweetId: '99', sourceUrl: quotedArticleCoverUrl },
+        { tweetId: '99', sourceUrl: quotedArticleInlineUrl },
         { tweetId: '99', sourceUrl: quotedPosterUrl },
         { tweetId: '99', sourceUrl: quotedPhotoUrl },
         { tweetId: '99', sourceUrl: quotedProfileUrl.replace('_normal.', '_400x400.') },
         { tweetId: '99', sourceUrl: quotedVideoUrl },
-      ]);
+      ].sort((a, b) => a.sourceUrl.localeCompare(b.sourceUrl));
+      assert.deepEqual(downloaded, expected);
     });
   } finally {
     globalThis.fetch = originalFetch;
@@ -253,6 +317,7 @@ test('fetchBookmarkMediaBatch downloads thread reply media targets', async () =>
   const replyVideoUrl = 'https://video.twimg.com/ext_tw_video/reply.mp4';
   const replyProfileUrl = 'https://pbs.twimg.com/profile_images/789/reply_normal.jpg';
   const contextPhotoUrl = 'https://pbs.twimg.com/media/context-photo.jpg';
+  const contextArticleCoverUrl = 'https://pbs.twimg.com/media/context-article-cover.jpg';
   const records = [{
     id: '1',
     tweetId: '1',
@@ -268,6 +333,7 @@ test('fetchBookmarkMediaBatch downloads thread reply media targets', async () =>
       text: 'context with media',
       authorHandle: 'alice',
       mediaObjects: [{ type: 'photo', url: contextPhotoUrl }],
+      articleCoverMedia: { media_info: { original_img_url: contextArticleCoverUrl } },
     }],
     threadBelow: [{
       id: '101',
@@ -312,6 +378,7 @@ test('fetchBookmarkMediaBatch downloads thread reply media targets', async () =>
         .sort((a, b) => a.sourceUrl.localeCompare(b.sourceUrl));
 
       const expected = [
+        { bookmarkId: '1', tweetId: '90', sourceUrl: contextArticleCoverUrl },
         { bookmarkId: '1', tweetId: '90', sourceUrl: contextPhotoUrl },
         { bookmarkId: '1', tweetId: '101', sourceUrl: replyPosterUrl },
         { bookmarkId: '1', tweetId: '101', sourceUrl: replyPhotoUrl },

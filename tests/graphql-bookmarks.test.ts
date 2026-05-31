@@ -901,6 +901,86 @@ test('syncGaps: enriches X Article bookmarks through TweetResult payload', async
   }, [xArticle]);
 });
 
+test('syncGaps: persists ordinary link-only article content into JSONL', async () => {
+  const linkArticle: BookmarkRecord = {
+    id: 'external-article',
+    tweetId: 'external-article',
+    url: 'https://x.com/alice/status/external-article',
+    text: 'https://example.com/deep-dive',
+    authorHandle: 'alice',
+    syncedAt: NOW,
+    postedAt: 'Fri Apr 10 19:26:31 +0000 2026',
+    links: ['https://example.com/deep-dive'],
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+
+  await withIsolatedGapFillDataDir(async () => {
+    await buildIndex();
+    const result = await syncGaps({
+      articleFetcher: async (url) => {
+        assert.equal(url, 'https://example.com/deep-dive');
+        return {
+          title: 'The Ads Deep Dive',
+          text: 'This is the full external article body that must be written back into the source JSONL archive.',
+          siteName: 'Example',
+        };
+      },
+    });
+
+    assert.equal(result.articlesEnriched, 1);
+
+    const refreshed = await getBookmarkById('external-article');
+    assert.ok(refreshed);
+    assert.equal(refreshed.articleTitle, 'The Ads Deep Dive');
+    assert.match(refreshed.articleText ?? '', /full external article body/);
+
+    const jsonl = await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8');
+    const stored = JSON.parse(jsonl.trim().split('\n').pop()!);
+    assert.equal(stored.articleTitle, 'The Ads Deep Dive');
+    assert.match(stored.articleText, /full external article body/);
+  }, [linkArticle]);
+});
+
+test('syncGaps: reports ordinary link-only article misses and persists resolved links', async () => {
+  const linkArticle: BookmarkRecord = {
+    id: 'external-miss',
+    tweetId: 'external-miss',
+    url: 'https://x.com/alice/status/external-miss',
+    text: 'https://t.co/deepdive',
+    authorHandle: 'alice',
+    syncedAt: NOW,
+    postedAt: 'Fri Apr 10 19:26:31 +0000 2026',
+    links: ['https://t.co/deepdive'],
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+
+  await withIsolatedGapFillDataDir(async () => {
+    await buildIndex();
+    const result = await syncGaps({
+      tcoResolver: async (url) => {
+        assert.equal(url, 'https://t.co/deepdive');
+        return 'https://example.com/deep-dive';
+      },
+      articleFetcher: async (url) => {
+        assert.equal(url, 'https://example.com/deep-dive');
+        return null;
+      },
+    });
+
+    assert.equal(result.articlesEnriched, 0);
+    assert.equal(result.failed, 1);
+    assert.equal(result.failures[0].tweetId, 'external-miss');
+    assert.equal(result.failures[0].reason, 'no article text extracted');
+    assert.equal(result.failures[0].url, 'https://example.com/deep-dive');
+
+    const jsonl = await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8');
+    const stored = JSON.parse(jsonl.trim().split('\n').pop()!);
+    assert.deepEqual(stored.links, ['https://t.co/deepdive', 'https://example.com/deep-dive']);
+  }, [linkArticle]);
+});
+
 test('syncGaps: reports X Article when fallback only returns tweet preview', async () => {
   const xArticle: BookmarkRecord = {
     id: '2042685676949270724',
@@ -990,6 +1070,81 @@ test('syncGaps: prioritizes X Article enrichment before other gap work', async (
 
     assert.equal(calls[0], 'article-tweet');
   }, [quotedMissing, truncated, xArticle]);
+});
+
+test('syncGaps: articlesOnly skips non-article quoted and truncated gaps but fills quoted X Articles', async () => {
+  const quotedMissing: BookmarkRecord = {
+    id: 'quoted-parent',
+    tweetId: 'quoted-parent',
+    url: 'https://x.com/alice/status/quoted-parent',
+    text: 'Quoting a missing tweet',
+    quotedStatusId: 'quoted-target',
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+  const quotedArticle: BookmarkRecord = {
+    id: 'quoted-article-parent',
+    tweetId: 'quoted-article-parent',
+    url: 'https://x.com/alice/status/quoted-article-parent',
+    text: 'Quoting an article',
+    quotedStatusId: 'quoted-article',
+    quotedTweet: {
+      id: 'quoted-article',
+      text: 'https://x.com/i/article/quoted-article-id',
+      links: ['https://x.com/i/article/quoted-article-id'],
+      url: 'https://x.com/bob/status/quoted-article',
+    },
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+  const truncated: BookmarkRecord = {
+    id: 'truncated',
+    tweetId: 'truncated',
+    url: 'https://x.com/alice/status/truncated',
+    text: 'x'.repeat(320),
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+  const xArticle: BookmarkRecord = {
+    id: 'article-tweet',
+    tweetId: 'article-tweet',
+    url: 'https://x.com/alice/status/article-tweet',
+    text: 'https://x.com/i/article/article-id',
+    links: ['https://x.com/i/article/article-id'],
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+
+  await withIsolatedGapFillDataDir(async () => {
+    await buildIndex();
+    const calls: string[] = [];
+    await syncGaps({
+      articlesOnly: true,
+      tweetFetcher: async (tweetId) => {
+        calls.push(tweetId);
+        return {
+          snapshot: { id: tweetId, text: 'preview', url: `https://x.com/alice/status/${tweetId}` },
+          article: {
+            title: tweetId === 'quoted-article' ? 'Quoted Article' : 'Article',
+            text: tweetId === 'quoted-article'
+              ? 'Quoted article body from X Article payload'
+              : 'Article body from X Article payload',
+          },
+          status: 'ok',
+          source: 'graphql',
+        };
+      },
+    });
+
+    assert.deepEqual(calls, ['article-tweet', 'quoted-article']);
+    const stored = await getBookmarkById('quoted-article-parent');
+    assert.equal(stored.quotedTweet?.articleTitle, 'Quoted Article');
+    assert.match(stored.quotedTweet?.articleText ?? '', /Quoted article body/);
+  }, [quotedMissing, quotedArticle, truncated, xArticle]);
 });
 
 async function withIsolatedGapFillDataDir(

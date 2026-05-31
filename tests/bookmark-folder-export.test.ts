@@ -126,6 +126,99 @@ test('exportReadableBookmarkArchive clean removes stale generated files', async 
   });
 });
 
+test('exportReadableBookmarkArchive sorts folder README entries by tweet date newest first', async () => {
+  await withIsolatedDataDir(async (dir) => {
+    const records = [
+      {
+        id: 'old',
+        tweetId: 'old',
+        url: 'https://x.com/example/status/old',
+        text: 'Older bookmark with a larger opaque sort index.',
+        authorHandle: 'example',
+        syncedAt: '2026-05-31T00:04:10.948Z',
+        postedAt: '2025-01-01T00:00:00.000Z',
+        sortIndex: '999',
+        folderIds: ['f-ads'],
+        folderNames: ['Ads'],
+        tags: [],
+        ingestedVia: 'graphql',
+      },
+      {
+        id: 'new',
+        tweetId: 'new',
+        url: 'https://x.com/example/status/new',
+        text: 'Newer bookmark with a smaller opaque sort index.',
+        authorHandle: 'example',
+        syncedAt: '2026-05-31T00:04:10.948Z',
+        postedAt: '2026-05-01T00:00:00.000Z',
+        sortIndex: '1',
+        folderIds: ['f-ads'],
+        folderNames: ['Ads'],
+        tags: [],
+        ingestedVia: 'graphql',
+      },
+    ];
+    await writeFile(path.join(dir, 'bookmarks.jsonl'), records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    await writeFile(path.join(dir, 'bookmark-folders-state.json'), JSON.stringify({
+      folders: [{ id: 'f-ads', name: 'Ads', order: 1, active: true }],
+    }, null, 2));
+
+    await exportReadableBookmarkArchive({ clean: true });
+
+    const folderIndex = await readFile(path.join(dir, 'readable', 'folders', '001 - Ads', 'README.md'), 'utf8');
+    assert.ok(
+      folderIndex.indexOf('Newer bookmark') < folderIndex.indexOf('Older bookmark'),
+      'newer tweets should appear before older tweets even when sortIndex points the other way',
+    );
+  });
+});
+
+test('exportReadableBookmarkArchive renders quoted X Article bodies', async () => {
+  await withIsolatedDataDir(async (dir) => {
+    const records = [
+      {
+        id: 'quoted-parent',
+        tweetId: 'quoted-parent',
+        url: 'https://x.com/example/status/quoted-parent',
+        text: 'This quote should not leave the article as a bare link.',
+        authorHandle: 'example',
+        syncedAt: '2026-05-31T00:04:10.948Z',
+        postedAt: '2026-05-01T00:00:00.000Z',
+        folderIds: ['f-ads'],
+        folderNames: ['Ads'],
+        quotedStatusId: 'quoted-article',
+        quotedTweet: {
+          id: 'quoted-article',
+          text: 'https://x.com/i/article/quoted-article-id',
+          links: ['https://x.com/i/article/quoted-article-id'],
+          url: 'https://x.com/quoted/status/quoted-article',
+          articleTitle: 'Quoted article title',
+          articleText: 'Quoted article body should appear verbatim in the readable markdown file.',
+        },
+      },
+    ];
+    await writeFile(path.join(dir, 'bookmarks.jsonl'), records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    await writeFile(path.join(dir, 'bookmark-folders-state.json'), JSON.stringify({
+      folders: [{ id: 'f-ads', name: 'Ads', order: 1, active: true }],
+    }, null, 2));
+
+    await exportReadableBookmarkArchive({ clean: true });
+
+    const folderDir = path.join(dir, 'readable', 'folders', '001 - Ads');
+    const files = await readdir(folderDir);
+    const tweetFile = files.find((file) => file.endsWith('.md') && file !== 'README.md');
+    assert.ok(tweetFile);
+    const markdown = await readFile(path.join(folderDir, tweetFile), 'utf8');
+    assert.match(markdown, /## Quoted Tweet/);
+    assert.match(markdown, /### Article/);
+    assert.match(markdown, /Quoted article title/);
+    assert.match(markdown, /Quoted article body should appear verbatim/);
+
+    const folderIndex = await readFile(path.join(folderDir, 'README.md'), 'utf8');
+    assert.match(folderIndex, /\| yes \|/);
+  });
+});
+
 test('exportReadableBookmarkArchive treats downloaded Twitter quality variants as covered media', async () => {
   await withIsolatedDataDir(async (dir) => {
     const records = [

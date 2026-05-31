@@ -52,7 +52,23 @@ export interface BookmarkEngagementSnapshot {
   viewCount?: number;
 }
 
-export interface QuotedTweetSnapshot {
+export interface TweetArticleSnapshot {
+  articleTitle?: string | null;
+  articleText?: string | null;
+  articleSite?: string | null;
+  articlePreviewText?: string | null;
+  articleSummaryText?: string | null;
+  articleFirstPublishedAt?: string | null;
+  articleModifiedAt?: string | null;
+  articleRestId?: string | null;
+  articleId?: string | null;
+  articleContentState?: unknown;
+  articleCoverMedia?: unknown;
+  articleMediaEntities?: unknown[];
+  enrichedAt?: string | null;
+}
+
+export interface QuotedTweetSnapshot extends TweetArticleSnapshot {
   id: string;
   text: string;
   authorHandle?: string;
@@ -75,7 +91,7 @@ export interface QuotedTweetSnapshot {
   url: string;
 }
 
-export interface ThreadTweetSnapshot {
+export interface ThreadTweetSnapshot extends TweetArticleSnapshot {
   id: string;
   text: string;
   authorHandle?: string;

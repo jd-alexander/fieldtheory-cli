@@ -93,12 +93,12 @@ function compareSortIndexDesc(a?: string | null, b?: string | null): number {
 }
 
 function compareRecordsForArchive(a: BookmarkRecord, b: BookmarkRecord): number {
+  const aTime = parseTimestampMs(a.postedAt) ?? parseTimestampMs(a.bookmarkedAt) ?? 0;
+  const bTime = parseTimestampMs(b.postedAt) ?? parseTimestampMs(b.bookmarkedAt) ?? 0;
+  if (aTime !== bTime) return bTime - aTime;
+
   const sortIndex = compareSortIndexDesc(a.sortIndex, b.sortIndex);
   if (sortIndex !== 0) return sortIndex;
-
-  const aTime = parseTimestampMs(a.bookmarkedAt) ?? parseTimestampMs(a.postedAt) ?? 0;
-  const bTime = parseTimestampMs(b.bookmarkedAt) ?? parseTimestampMs(b.postedAt) ?? 0;
-  if (aTime !== bTime) return bTime - aTime;
 
   return b.tweetId.localeCompare(a.tweetId);
 }
@@ -199,6 +199,45 @@ function renderMediaMarkdown(
   return lines.filter((line, index, arr) => !(line === '' && arr[index - 1] === ''));
 }
 
+function hasArticleContent(source: {
+  articleText?: string | null;
+  articleTitle?: string | null;
+  articlePreviewText?: string | null;
+  articleSummaryText?: string | null;
+}): boolean {
+  return Boolean(source.articleText || source.articleTitle || source.articlePreviewText || source.articleSummaryText);
+}
+
+function renderArticleMarkdown(
+  heading: string,
+  source: {
+    articleTitle?: string | null;
+    articleText?: string | null;
+    articleSite?: string | null;
+    articlePreviewText?: string | null;
+    articleSummaryText?: string | null;
+    articleFirstPublishedAt?: string | null;
+    articleModifiedAt?: string | null;
+  },
+): string[] {
+  if (!hasArticleContent(source)) return [];
+  const lines: string[] = [];
+  lines.push(heading);
+  if (source.articleTitle) {
+    lines.push(`### ${oneLine(source.articleTitle)}`);
+    lines.push('');
+  }
+  if (source.articleSite) lines.push(`Source: ${oneLine(source.articleSite)}`);
+  if (source.articleFirstPublishedAt) lines.push(`Published: ${source.articleFirstPublishedAt}`);
+  if (source.articleModifiedAt) lines.push(`Modified: ${source.articleModifiedAt}`);
+  if (source.articleSite || source.articleFirstPublishedAt || source.articleModifiedAt) lines.push('');
+  if (source.articleText) lines.push(source.articleText.trim());
+  else if (source.articleSummaryText) lines.push(source.articleSummaryText.trim());
+  else if (source.articlePreviewText) lines.push(source.articlePreviewText.trim());
+  lines.push('');
+  return lines;
+}
+
 function mediaCoverageKeys(sourceUrl: string): string[] {
   const keys = [sourceUrl];
   try {
@@ -235,6 +274,7 @@ function renderTweetSnapshot(
     lines.push(...mediaLines);
     lines.push('');
   }
+  lines.push(...renderArticleMarkdown('### Article', tweet));
   lines.push(`[Original tweet](${tweet.url})`);
   lines.push('');
   return lines;
@@ -271,21 +311,7 @@ function renderBookmarkMarkdown(
     lines.push('');
   }
 
-  if (record.articleText || record.articleTitle || record.articlePreviewText || record.articleSummaryText) {
-    lines.push('## Article');
-    if (record.articleTitle) {
-      lines.push(`### ${oneLine(record.articleTitle)}`);
-      lines.push('');
-    }
-    if (record.articleSite) lines.push(`Source: ${oneLine(record.articleSite)}`);
-    if (record.articleFirstPublishedAt) lines.push(`Published: ${record.articleFirstPublishedAt}`);
-    if (record.articleModifiedAt) lines.push(`Modified: ${record.articleModifiedAt}`);
-    if (record.articleSite || record.articleFirstPublishedAt || record.articleModifiedAt) lines.push('');
-    if (record.articleText) lines.push(record.articleText.trim());
-    else if (record.articleSummaryText) lines.push(record.articleSummaryText.trim());
-    else if (record.articlePreviewText) lines.push(record.articlePreviewText.trim());
-    lines.push('');
-  }
+  lines.push(...renderArticleMarkdown('## Article', record));
 
   if (record.links?.length) {
     lines.push('## Links');
@@ -441,7 +467,7 @@ function folderIndexMarkdown(folder: ArchiveFolder, folderReadmePath: string, fi
     const label = tableCell(oneLine(record.text).slice(0, 90) || record.tweetId);
     const title = rel ? `[${label}](${rel})` : label;
     const mediaCount = (record.mediaObjects?.length ?? record.media?.length ?? 0);
-    const article = record.articleText || record.articleTitle ? 'yes' : '';
+    const article = hasArticleContent(record) || (record.quotedTweet ? hasArticleContent(record.quotedTweet) : false) ? 'yes' : '';
     lines.push(`| ${fileDate(record)} | ${tableCell(record.authorHandle ? `@${record.authorHandle}` : 'Unknown')} | ${title} | ${mediaCount} | ${article} |`);
   }
   lines.push('');

@@ -327,7 +327,7 @@ function printMediaFetchSummary(result: MediaFetchManifest): void {
   console.log(`  ✓ Manifest: ${bookmarkMediaManifestPath()}`);
 }
 
-async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; mediaQuality?: MediaQuality; skipProfileImages?: boolean; retryFailed?: boolean } = {}): Promise<MediaFetchManifest> {
+async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; mediaQuality?: MediaQuality; skipProfileImages?: boolean; retryFailed?: boolean; folderNames?: string[] } = {}): Promise<MediaFetchManifest> {
   const startTime = Date.now();
   const controller = new AbortController();
   let lastMedia: MediaFetchProgress = {
@@ -352,6 +352,7 @@ async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: n
     mediaQuality: options.mediaQuality,
     skipProfileImages: options.skipProfileImages,
     retryFailed: options.retryFailed,
+    folderNames: options.folderNames,
     signal: controller.signal,
     onProgress: (progress: MediaFetchProgress) => {
       lastMedia = progress;
@@ -917,6 +918,8 @@ export function buildCli() {
     .option('--media-limit <n>', 'Cap on pending bookmarks whose media gets fetched after sync (default: all)', (v: string) => Number(v))
     .option('--media-max-bytes <n>', 'Per-asset byte limit for media downloads (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
     .option('--media-quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
+    .option('--article-limit <n>', 'Cap article page fetches during --gaps (default: all)', parseNonNegativeInteger)
+    .option('--articles-only', 'With --gaps, fetch article bodies only; skip quoted tweets and long-text expansion', false)
     .option('--skip-profile-images', 'Skip downloading author profile images', false)
     .option('--max-pages <n>', 'Max pages to fetch (default: unlimited)', (v: string) => Number(v))
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
@@ -1073,7 +1076,9 @@ export function buildCli() {
         // ── gaps mode: backfill missing data for existing bookmarks ──
         if (options.gaps) {
           const startTime = Date.now();
-          const opening = downloadMedia
+          const opening = options.articlesOnly
+            ? '  Filling article gaps...\n'
+            : downloadMedia
             ? '  Filling gaps (quoted tweets, truncated text, articles, media)...\n'
             : '  Filling gaps (quoted tweets, truncated text, articles)...\n';
           process.stderr.write(opening);
@@ -1099,6 +1104,10 @@ export function buildCli() {
             firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
             csrfToken: gapCsrfToken,
             cookieHeader: gapCookieHeader,
+            articleLimit: typeof options.articleLimit === 'number' && !Number.isNaN(options.articleLimit)
+              ? options.articleLimit
+              : undefined,
+            articlesOnly: Boolean(options.articlesOnly),
             onProgress: (progress: GapFillProgress) => {
               lastProgress = progress;
               spinner.update();
@@ -2153,6 +2162,7 @@ export function buildCli() {
     .option('--limit <n>', 'Max pending bookmarks to process (default: all)', (v: string) => Number(v))
     .option('--max-bytes <n>', 'Per-asset byte limit (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
     .option('--quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
+    .option('--folder <name>', 'Only fetch media for this X bookmark folder; repeat for a selected batch', collectOptionValue)
     .option('--skip-profile-images', 'Skip downloading author profile images')
     .option('--retry-failed', 'Retry failed media entries without waiting for backoff')
     .option('--delay-ms <n>', 'Minimum delay between media HTTP requests in ms (default: 2000)', parseNonNegativeInteger))
@@ -2167,6 +2177,7 @@ export function buildCli() {
         mediaQuality: parseMediaQuality(options.quality),
         skipProfileImages: Boolean(options.skipProfileImages),
         retryFailed: Boolean(options.retryFailed),
+        folderNames: normalizeOptionStrings(options.folder),
       });
     }));
 

@@ -1,3 +1,5 @@
+import { controlledFetch, isHttpSafetyStop } from './http-safety.js';
+
 /**
  * Article extraction for link-heavy bookmarks.
  *
@@ -192,13 +194,18 @@ async function fetchFollowingRedirects(
 
     let res: Response;
     try {
-      res = await fetch(current, {
+      res = await controlledFetch(current, {
         method,
         headers: BROWSER_HEADERS,
         redirect: 'manual',
         signal: options.signal,
+      }, {
+        operation: method === 'HEAD' ? 'ResolveArticleLink' : 'FetchArticle',
+        category: 'external',
+        cursorPresent: hop > 0,
       });
-    } catch {
+    } catch (error) {
+      if (isHttpSafetyStop(error)) throw error;
       return null;
     }
 

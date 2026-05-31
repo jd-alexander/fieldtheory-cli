@@ -260,6 +260,8 @@ function resolveMediaTargets(
       authorProfileImageUrl: bookmark.quotedTweet.authorProfileImageUrl,
       media: bookmark.quotedTweet.media,
       mediaObjects: bookmark.quotedTweet.mediaObjects,
+      articleCoverMedia: bookmark.quotedTweet.articleCoverMedia,
+      articleMediaEntities: bookmark.quotedTweet.articleMediaEntities,
     }, downloadedProfileImageUrls, skipProfileImages, mediaQuality);
   }
 
@@ -272,6 +274,8 @@ function resolveMediaTargets(
       authorProfileImageUrl: tweet.authorProfileImageUrl,
       media: tweet.media,
       mediaObjects: tweet.mediaObjects,
+      articleCoverMedia: tweet.articleCoverMedia,
+      articleMediaEntities: tweet.articleMediaEntities,
     }, downloadedProfileImageUrls, skipProfileImages, mediaQuality);
   };
 
@@ -339,7 +343,16 @@ function hasPendingMediaTarget(
 }
 
 export async function fetchBookmarkMediaBatch(
-  options: { limit?: number; maxBytes?: number; skipProfileImages?: boolean; retryFailed?: boolean; mediaQuality?: MediaQuality; signal?: AbortSignal; onProgress?: (progress: MediaFetchProgress) => void } = {}
+  options: {
+    limit?: number;
+    maxBytes?: number;
+    skipProfileImages?: boolean;
+    retryFailed?: boolean;
+    mediaQuality?: MediaQuality;
+    folderNames?: string[];
+    signal?: AbortSignal;
+    onProgress?: (progress: MediaFetchProgress) => void;
+  } = {}
 ): Promise<MediaFetchManifest> {
   const limit = typeof options.limit === 'number' && !Number.isNaN(options.limit)
     ? Math.max(0, options.limit)
@@ -348,6 +361,7 @@ export async function fetchBookmarkMediaBatch(
   const skipProfileImages = options.skipProfileImages ?? false;
   const retryFailed = options.retryFailed ?? false;
   const mediaQuality = options.mediaQuality ?? DEFAULT_MEDIA_QUALITY;
+  const folderNames = (options.folderNames ?? []).map((name) => name.trim().toLowerCase()).filter(Boolean);
   const nowMs = Date.now();
   const mediaDir = bookmarkMediaDir();
   const manifestPath = bookmarkMediaManifestPath();
@@ -358,6 +372,10 @@ export async function fetchBookmarkMediaBatch(
   const coveredProfileImageUrls = buildCoveredProfileImageUrls(previous, maxBytes, retryFailed, nowMs);
   const bookmarks = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
   const candidates = bookmarks
+    .filter((bookmark) =>
+      folderNames.length === 0 ||
+      (bookmark.folderNames ?? []).some((name) => folderNames.includes(name.trim().toLowerCase()))
+    )
     .filter(hasMediaCandidate)
     .filter((bookmark) => hasPendingMediaTarget(bookmark, coveredAssetKeys, coveredProfileImageUrls, skipProfileImages, mediaQuality))
     .slice(0, limit);
