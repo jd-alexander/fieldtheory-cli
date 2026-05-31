@@ -109,14 +109,6 @@ function bookmarkFileName(record: BookmarkRecord): string {
   return `${fileDate(record)}-${author}-${textPart}-${record.tweetId}.md`;
 }
 
-function yamlString(value: string): string {
-  return JSON.stringify(value);
-}
-
-function yamlArray(values: string[]): string {
-  return `[${values.map(yamlString).join(', ')}]`;
-}
-
 function tableCell(value: string): string {
   return value.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
 }
@@ -251,47 +243,15 @@ function renderBookmarkMarkdown(
   mediaByTweetId: Map<string, MediaFetchEntry[]>,
 ): string {
   const lines: string[] = [];
-  const folderNames = record.folderNames ?? [];
-
-  lines.push('---');
-  lines.push(`tweet_id: ${yamlString(record.tweetId)}`);
-  lines.push(`source_url: ${yamlString(record.url)}`);
-  if (record.authorHandle) lines.push(`author: ${yamlString(`@${record.authorHandle}`)}`);
-  if (record.authorName) lines.push(`author_name: ${yamlString(record.authorName)}`);
-  if (record.postedAt) lines.push(`posted_at: ${yamlString(record.postedAt)}`);
-  if (record.bookmarkedAt) lines.push(`bookmarked_at: ${yamlString(record.bookmarkedAt)}`);
-  lines.push(`synced_at: ${yamlString(record.syncedAt)}`);
-  lines.push(`folder: ${yamlString(folder.name)}`);
-  if (folderNames.length > 0) lines.push(`folders: ${yamlArray(folderNames)}`);
-  if (record.articleTitle) lines.push(`article_title: ${yamlString(record.articleTitle)}`);
-  lines.push('---');
-  lines.push('');
-
+  const folderNames = record.folderNames?.length ? record.folderNames : [folder.name];
   const author = record.authorHandle ? `@${record.authorHandle}` : 'Unknown';
-  lines.push(`# ${author} - ${record.tweetId}`);
+  const titleParts = [author];
+  if (record.authorName && record.authorName !== record.authorHandle) titleParts.push(record.authorName);
+  lines.push(`# ${titleParts.join(' - ')}`);
   lines.push('');
 
-  lines.push('## Tweet');
-  lines.push(record.text);
+  if (record.text) lines.push(record.text);
   lines.push('');
-
-  const details: Array<[string, string | undefined]> = [
-    ['Posted', record.postedAt ?? undefined],
-    ['Bookmarked', record.bookmarkedAt ?? undefined],
-    ['Synced', record.syncedAt],
-    ['Sort index', record.sortIndex ?? undefined],
-    ['Language', record.language],
-    ['Likes', record.engagement?.likeCount != null ? String(record.engagement.likeCount) : undefined],
-    ['Reposts', record.engagement?.repostCount != null ? String(record.engagement.repostCount) : undefined],
-    ['Replies', record.engagement?.replyCount != null ? String(record.engagement.replyCount) : undefined],
-    ['Views', record.engagement?.viewCount != null ? String(record.engagement.viewCount) : undefined],
-  ];
-  const presentDetails = details.filter(([, value]) => value);
-  if (presentDetails.length > 0) {
-    lines.push('## Details');
-    for (const [label, value] of presentDetails) lines.push(`- ${label}: ${value}`);
-    lines.push('');
-  }
 
   const mediaLines = renderMediaMarkdown(
     filePath,
@@ -346,8 +306,20 @@ function renderBookmarkMarkdown(
     }
   }
 
-  lines.push('## Source');
-  lines.push(`[Original tweet](${record.url})`);
+  lines.push('## Metadata');
+  lines.push(`- Tweet ID: \`${record.tweetId}\``);
+  lines.push(`- Source: [Original tweet](${record.url})`);
+  lines.push(`- Folder: ${folder.name}`);
+  if (folderNames.length > 0) lines.push(`- Folders: ${folderNames.join(', ')}`);
+  if (record.postedAt) lines.push(`- Posted: ${record.postedAt}`);
+  if (record.bookmarkedAt) lines.push(`- Bookmarked: ${record.bookmarkedAt}`);
+  lines.push(`- Synced: ${record.syncedAt}`);
+  if (record.sortIndex) lines.push(`- Sort index: ${record.sortIndex}`);
+  if (record.language) lines.push(`- Language: ${record.language}`);
+  if (record.engagement?.likeCount != null) lines.push(`- Likes: ${record.engagement.likeCount}`);
+  if (record.engagement?.repostCount != null) lines.push(`- Reposts: ${record.engagement.repostCount}`);
+  if (record.engagement?.replyCount != null) lines.push(`- Replies: ${record.engagement.replyCount}`);
+  if (record.engagement?.viewCount != null) lines.push(`- Views: ${record.engagement.viewCount}`);
   lines.push('');
 
   return lines.join('\n');

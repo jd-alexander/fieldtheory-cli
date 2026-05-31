@@ -91,10 +91,15 @@ test('exportReadableBookmarkArchive writes folder directories, tweet markdown, a
     assert.ok(bookmarkFile);
 
     const content = await readFile(path.join(folderDir, bookmarkFile), 'utf8');
-    assert.match(content, /# @example - 2060204743000240157/);
+    assert.ok(
+      content.startsWith('# @example - Example Author\n\nA full bookmark with multiple screenshots and useful context.'),
+      'readable bookmark files should open with the useful tweet content, not metadata frontmatter',
+    );
+    assert.doesNotMatch(content.slice(0, 200), /---|tweet_id:|posted_at:|synced_at:/);
     assert.match(content, /A full bookmark with multiple screenshots/);
     assert.match(content, /!\[2060204743000240157-local\.jpg\]\(\.\.\/\.\.\/\.\.\/media\/2060204743000240157-local\.jpg\)/);
     assert.match(content, /## Links\n- https:\/\/example\.com/);
+    assert.match(content, /## Metadata[\s\S]*Tweet ID: `2060204743000240157`/);
 
     const folderIndex = await readFile(path.join(folderDir, 'README.md'), 'utf8');
     assert.match(folderIndex, /Record hash: `hash-1`/);
