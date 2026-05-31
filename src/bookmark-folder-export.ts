@@ -308,10 +308,9 @@ function renderBookmarkMarkdown(
   mediaByTweetId: Map<string, MediaFetchEntry[]>,
 ): string {
   const lines: string[] = [];
-  const folderDisplayName = folder.name.trim();
-  const folderNames = (record.folderNames?.length ? record.folderNames : [folder.name])
+  const folderNames = [...new Set((record.folderNames?.length ? record.folderNames : [folder.name])
     .map((name) => name.trim())
-    .filter(Boolean);
+    .filter(Boolean))];
   const author = record.authorHandle ? `@${record.authorHandle}` : 'Unknown';
   const titleParts = [author];
   if (record.authorName && record.authorName !== record.authorHandle) titleParts.push(record.authorName);
@@ -363,8 +362,7 @@ function renderBookmarkMarkdown(
   lines.push('## Metadata');
   lines.push(`- Tweet ID: \`${record.tweetId}\``);
   lines.push(`- Source: [Original tweet](${record.url})`);
-  lines.push(`- Folder: ${folderDisplayName}`);
-  if (folderNames.length > 0) lines.push(`- Folders: ${folderNames.join(', ')}`);
+  if (folderNames.length > 1) lines.push(`- Folders: ${folderNames.join(', ')}`);
   if (record.postedAt) lines.push(`- Posted: ${record.postedAt}`);
   if (record.bookmarkedAt) lines.push(`- Bookmarked: ${record.bookmarkedAt}`);
   lines.push(`- Synced: ${record.syncedAt}`);

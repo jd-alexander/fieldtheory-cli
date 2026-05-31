@@ -100,8 +100,8 @@ test('exportReadableBookmarkArchive writes folder directories, tweet markdown, a
     assert.match(content, /!\[2060204743000240157-local\.jpg\]\(\.\.\/\.\.\/\.\.\/media\/2060204743000240157-local\.jpg\)/);
     assert.match(content, /## Links\n- https:\/\/example\.com/);
     assert.match(content, /## Metadata[\s\S]*Tweet ID: `2060204743000240157`/);
-    assert.match(content, /- Folder: App Store Screenshots\n/);
-    assert.match(content, /- Folders: App Store Screenshots\n/);
+    assert.doesNotMatch(content, /- Folder: App Store Screenshots\n/);
+    assert.doesNotMatch(content, /- Folders: App Store Screenshots\n/);
     assert.doesNotMatch(content, /App Store Screenshots \n/);
 
     const folderIndex = await readFile(path.join(folderDir, 'README.md'), 'utf8');
@@ -110,6 +110,43 @@ test('exportReadableBookmarkArchive writes folder directories, tweet markdown, a
 
     const rootIndex = await readFile(path.join(dir, 'readable', 'README.md'), 'utf8');
     assert.match(rootIndex, /\[App Store Screenshots\]\(folders\/001 - App Store Screenshots\/README\.md\)/);
+  });
+});
+
+test('exportReadableBookmarkArchive shows folder metadata only for multi-folder bookmarks', async () => {
+  await withIsolatedDataDir(async (dir) => {
+    const records = [
+      {
+        id: 'multi',
+        tweetId: 'multi',
+        url: 'https://x.com/example/status/multi',
+        text: 'Bookmark filed in two folders.',
+        authorHandle: 'example',
+        syncedAt: '2026-05-31T00:04:10.948Z',
+        postedAt: '2026-05-01T00:00:00.000Z',
+        folderIds: ['f-ads', 'f-ai'],
+        folderNames: ['Ads', 'AI Code Gen'],
+        tags: [],
+        ingestedVia: 'graphql',
+      },
+    ];
+    await writeFile(path.join(dir, 'bookmarks.jsonl'), records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    await writeFile(path.join(dir, 'bookmark-folders-state.json'), JSON.stringify({
+      folders: [
+        { id: 'f-ads', name: 'Ads', order: 1, active: true },
+        { id: 'f-ai', name: 'AI Code Gen', order: 2, active: true },
+      ],
+    }, null, 2));
+
+    await exportReadableBookmarkArchive({ clean: true });
+
+    const folderDir = path.join(dir, 'readable', 'folders', '001 - Ads');
+    const files = await readdir(folderDir);
+    const bookmarkFile = files.find((file) => file.endsWith('.md') && file !== 'README.md');
+    assert.ok(bookmarkFile);
+    const content = await readFile(path.join(folderDir, bookmarkFile), 'utf8');
+    assert.doesNotMatch(content, /- Folder:/);
+    assert.match(content, /- Folders: Ads, AI Code Gen\n/);
   });
 });
 
