@@ -31,7 +31,7 @@ test('exportReadableBookmarkArchive writes folder directories, tweet markdown, a
         postedAt: '2026-05-29T15:00:00.000Z',
         sortIndex: '999',
         folderIds: ['f-app-store'],
-        folderNames: ['App Store Screenshots'],
+        folderNames: ['App Store Screenshots '],
         mediaObjects: [
           { type: 'photo', url: 'https://pbs.twimg.com/media/source.jpg', mediaUrl: 'https://pbs.twimg.com/media/source.jpg' },
         ],
@@ -43,7 +43,7 @@ test('exportReadableBookmarkArchive writes folder directories, tweet markdown, a
       folders: [
         {
           id: 'f-app-store',
-          name: 'App Store Screenshots',
+          name: 'App Store Screenshots ',
           order: 1,
           active: true,
           lastSyncedAt: '2026-05-31T00:04:10.948Z',
@@ -100,6 +100,9 @@ test('exportReadableBookmarkArchive writes folder directories, tweet markdown, a
     assert.match(content, /!\[2060204743000240157-local\.jpg\]\(\.\.\/\.\.\/\.\.\/media\/2060204743000240157-local\.jpg\)/);
     assert.match(content, /## Links\n- https:\/\/example\.com/);
     assert.match(content, /## Metadata[\s\S]*Tweet ID: `2060204743000240157`/);
+    assert.match(content, /- Folder: App Store Screenshots\n/);
+    assert.match(content, /- Folders: App Store Screenshots\n/);
+    assert.doesNotMatch(content, /App Store Screenshots \n/);
 
     const folderIndex = await readFile(path.join(folderDir, 'README.md'), 'utf8');
     assert.match(folderIndex, /Record hash: `hash-1`/);

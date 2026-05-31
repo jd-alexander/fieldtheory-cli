@@ -78,6 +78,10 @@ function folderDirName(folder: ArchiveFolder): string {
   return `${prefix} - ${sanitizePathSegment(folder.name)}`;
 }
 
+function cleanFolderName(value: string | undefined, fallback: string): string {
+  return value?.trim() || fallback;
+}
+
 function compareSortIndexDesc(a?: string | null, b?: string | null): number {
   if (a && b) {
     if (a.length !== b.length) return b.length - a.length;
@@ -243,7 +247,10 @@ function renderBookmarkMarkdown(
   mediaByTweetId: Map<string, MediaFetchEntry[]>,
 ): string {
   const lines: string[] = [];
-  const folderNames = record.folderNames?.length ? record.folderNames : [folder.name];
+  const folderDisplayName = folder.name.trim();
+  const folderNames = (record.folderNames?.length ? record.folderNames : [folder.name])
+    .map((name) => name.trim())
+    .filter(Boolean);
   const author = record.authorHandle ? `@${record.authorHandle}` : 'Unknown';
   const titleParts = [author];
   if (record.authorName && record.authorName !== record.authorHandle) titleParts.push(record.authorName);
@@ -309,7 +316,7 @@ function renderBookmarkMarkdown(
   lines.push('## Metadata');
   lines.push(`- Tweet ID: \`${record.tweetId}\``);
   lines.push(`- Source: [Original tweet](${record.url})`);
-  lines.push(`- Folder: ${folder.name}`);
+  lines.push(`- Folder: ${folderDisplayName}`);
   if (folderNames.length > 0) lines.push(`- Folders: ${folderNames.join(', ')}`);
   if (record.postedAt) lines.push(`- Posted: ${record.postedAt}`);
   if (record.bookmarkedAt) lines.push(`- Bookmarked: ${record.bookmarkedAt}`);
@@ -360,7 +367,7 @@ function buildArchiveFolders(
     const ids = record.folderIds ?? [];
     const names = record.folderNames ?? [];
     ids.forEach((id, index) => {
-      const name = names[index] ?? id;
+      const name = cleanFolderName(names[index], id);
       knownNamesById.set(id, name);
       const current = recordsByFolderId.get(id) ?? [];
       current.push(record);
@@ -377,7 +384,7 @@ function buildArchiveFolders(
     if (folderRecords.length === 0 && !folder.active) continue;
     folders.push({
       id: folder.id,
-      name: folder.name,
+      name: cleanFolderName(folder.name, folder.id),
       order: folder.order ?? folders.length + 1,
       active: folder.active ?? true,
       lastListedAt: folder.lastListedAt,
@@ -393,7 +400,7 @@ function buildArchiveFolders(
   for (const id of unknownIds) {
     folders.push({
       id,
-      name: knownNamesById.get(id) ?? id,
+      name: cleanFolderName(knownNamesById.get(id), id),
       order: folders.length + 1,
       active: true,
       records: [...(recordsByFolderId.get(id) ?? [])].sort(compareRecordsForArchive),
