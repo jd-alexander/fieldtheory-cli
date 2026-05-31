@@ -96,12 +96,29 @@ export function twitterBackfillStatePath(): string {
   return path.join(dataDir(), 'bookmarks-backfill-state.json');
 }
 
+export function twitterBookmarkFoldersStatePath(): string {
+  return path.join(dataDir(), 'bookmark-folders-state.json');
+}
+
 export function bookmarkMediaDir(): string {
   return path.join(dataDir(), 'media');
 }
 
 export function bookmarkMediaManifestPath(): string {
   return path.join(dataDir(), 'media-manifest.json');
+}
+
+export function readableArchiveDir(): string {
+  return path.join(dataDir(), 'readable');
+}
+
+export function httpAuditLogDir(): string {
+  return path.join(dataDir(), 'logs');
+}
+
+export function httpAuditLogPath(date = new Date()): string {
+  const stamp = date.toISOString().slice(0, 10);
+  return path.join(httpAuditLogDir(), `http-audit-${stamp}.jsonl`);
 }
 
 export function twitterBookmarksIndexPath(): string {

@@ -4,6 +4,12 @@ export interface BookmarkMediaVariant {
   bitrate?: number;
 }
 
+export interface BookmarkTaggedUser {
+  name?: string;
+  screenName?: string;
+  userId?: string;
+}
+
 export interface BookmarkMediaObject {
   url?: string;
   mediaUrl?: string;
@@ -16,19 +22,25 @@ export interface BookmarkMediaObject {
   height?: number;
   videoVariants?: BookmarkMediaVariant[];
   variants?: BookmarkMediaVariant[];
+  taggedUsers?: BookmarkTaggedUser[];
 }
 
 export interface BookmarkAuthorSnapshot {
+  id?: string;
   handle?: string;
   name?: string;
   profileImageUrl?: string;
+  bio?: string;
   description?: string;
   location?: string;
   url?: string;
+  isVerified?: boolean;
   verified?: boolean;
+  followerCount?: number;
   followersCount?: number;
   followingCount?: number;
   statusesCount?: number;
+  snapshotAt?: string;
 }
 
 export interface BookmarkEngagementSnapshot {
@@ -40,7 +52,46 @@ export interface BookmarkEngagementSnapshot {
   viewCount?: number;
 }
 
-export interface QuotedTweetSnapshot {
+export interface TweetArticleSnapshot {
+  articleTitle?: string | null;
+  articleText?: string | null;
+  articleSite?: string | null;
+  articlePreviewText?: string | null;
+  articleSummaryText?: string | null;
+  articleFirstPublishedAt?: string | null;
+  articleModifiedAt?: string | null;
+  articleRestId?: string | null;
+  articleId?: string | null;
+  articleContentState?: unknown;
+  articleCoverMedia?: unknown;
+  articleMediaEntities?: unknown[];
+  enrichedAt?: string | null;
+}
+
+export interface QuotedTweetSnapshot extends TweetArticleSnapshot {
+  id: string;
+  text: string;
+  authorHandle?: string;
+  authorName?: string;
+  authorProfileImageUrl?: string;
+  author?: BookmarkAuthorSnapshot;
+  postedAt?: string | null;
+  conversationId?: string;
+  inReplyToStatusId?: string;
+  inReplyToUserId?: string;
+  quotedStatusId?: string;
+  language?: string;
+  sourceApp?: string;
+  possiblySensitive?: boolean;
+  displayTextRange?: [number, number];
+  engagement?: BookmarkEngagementSnapshot;
+  links?: string[];
+  media?: string[];
+  mediaObjects?: BookmarkMediaObject[];
+  url: string;
+}
+
+export interface ThreadTweetSnapshot extends TweetArticleSnapshot {
   id: string;
   text: string;
   authorHandle?: string;
@@ -49,6 +100,20 @@ export interface QuotedTweetSnapshot {
   postedAt?: string | null;
   media?: string[];
   mediaObjects?: BookmarkMediaObject[];
+  links?: string[];
+  conversationId?: string;
+  inReplyToStatusId?: string;
+  /**
+   * How this tweet relates to the bookmarked tweet in X's conversation UI.
+   * `post-thread` means X presents it as the author's continuation of the
+   * focal post, not as the author's response inside someone else's reply branch.
+   */
+  threadRole?: 'post-thread';
+  conversationEntryId?: string;
+  conversationDisplayType?: string;
+  conversationSection?: string;
+  conversationRootId?: string;
+  conversationItemIndex?: number;
   url: string;
 }
 
@@ -71,9 +136,19 @@ export interface BookmarkRecord {
   inReplyToUserId?: string;
   quotedStatusId?: string;
   quotedTweet?: QuotedTweetSnapshot;
+  displayTextRange?: [number, number];
   articleTitle?: string | null;
   articleText?: string | null;
   articleSite?: string | null;
+  articlePreviewText?: string | null;
+  articleSummaryText?: string | null;
+  articleFirstPublishedAt?: string | null;
+  articleModifiedAt?: string | null;
+  articleRestId?: string | null;
+  articleId?: string | null;
+  articleContentState?: unknown;
+  articleCoverMedia?: unknown;
+  articleMediaEntities?: unknown[];
   enrichedAt?: string | null;
   language?: string;
   sourceApp?: string;
@@ -88,6 +163,12 @@ export interface BookmarkRecord {
   folderIds?: string[];
   folderNames?: string[];
   /**
+   * Parallel to folderIds/folderNames. Stores X's opaque per-folder timeline
+   * ordering key so each readable folder can keep X's placement as a stable
+   * tiebreaker, even when a tweet appears in multiple folders.
+   */
+  folderSortIndices?: Array<string | null>;
+  /**
    * Set once `ft sync --gaps` has attempted to expand long-form text for this
    * record. Present regardless of whether expansion actually lengthened the
    * stored text — its purpose is to keep the gap-fill selector idempotent so
@@ -100,6 +181,20 @@ export interface BookmarkRecord {
    * same dead tweet on every run.
    */
   quotedTweetFailedAt?: string;
+  /** Parent tweets above the bookmarked tweet, oldest first. */
+  threadContext?: ThreadTweetSnapshot[];
+  /** Same-author continuation tweets below the bookmarked tweet. */
+  threadBelow?: ThreadTweetSnapshot[];
+  /**
+   * Last time thread expansion checked this record. Empty thread arrays are a
+   * completed check, but recent tweets are rechecked for delayed self-replies.
+   */
+  threadExpandedAt?: string;
+  /**
+   * Set when thread expansion hit a permanent failure for the focal tweet,
+   * preventing repeated fetches for deleted or unavailable tweets.
+   */
+  threadExpansionFailedAt?: string;
 }
 
 export interface BookmarkFolder {

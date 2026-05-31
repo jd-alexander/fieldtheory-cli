@@ -393,6 +393,32 @@ test('ft sync: media is on by default and exposes --no-media', () => {
   assert.ok(mediaOption, 'a media option must be registered');
   assert.equal(mediaOption.negate, true, 'the media option must be --no-media (negated)');
   assert.equal(mediaOption.long, '--no-media');
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--media-limit'));
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--media-quality'));
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--audit-http'));
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--request-budget'));
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--rate-limit-floor'));
+  const folderOption = syncCmd.options.find((o: any) => o.long === '--folder');
+  assert.ok(folderOption);
+  assert.match(folderOption.description, /repeat/i);
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--prune-folder-tags'));
+});
+
+test('ft fetch-media exposes media quality option', () => {
+  const program = buildCli();
+  const fetchMediaCmd = program.commands.find((c: any) => c.name() === 'fetch-media');
+  assert.ok(fetchMediaCmd, 'fetch-media command should be registered');
+  assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--quality'));
+  assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--audit-http'));
+  assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--request-budget'));
+});
+
+test('ft archive-md command is registered', () => {
+  const program = buildCli();
+  const archiveCmd = program.commands.find((c: any) => c.name() === 'archive-md');
+  assert.ok(archiveCmd, 'archive-md command should be registered');
+  assert.ok(archiveCmd.options.some((o: any) => o.long === '--clean'));
+  assert.ok(archiveCmd.options.some((o: any) => o.long === '--no-unfiled'));
 });
 
 test('ft wiki: description mentions engine prerequisite', () => {

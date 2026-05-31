@@ -3,11 +3,13 @@ import { Command, InvalidArgumentError, Option } from 'commander';
 import { syncTwitterBookmarks } from './bookmarks.js';
 import { getBookmarkStatusView, formatBookmarkStatus } from './bookmarks-service.js';
 import { runTwitterOAuthFlow } from './xauth.js';
-import { syncBookmarksGraphQL, syncGaps, syncBookmarkFolders } from './graphql-bookmarks.js';
-import type { SyncProgress, GapFillProgress, FolderSyncProgress } from './graphql-bookmarks.js';
-import type { BookmarkFolder, QuotedTweetSnapshot } from './types.js';
-import { DEFAULT_MEDIA_MAX_BYTES, fetchBookmarkMediaBatch } from './bookmark-media.js';
+import { syncBookmarksGraphQL, syncGaps, syncBookmarkFolders, syncThreads } from './graphql-bookmarks.js';
+import type { SyncProgress, GapFillProgress, FolderSyncProgress, ThreadSyncProgress } from './graphql-bookmarks.js';
+import type { BookmarkFolder, QuotedTweetSnapshot, ThreadTweetSnapshot } from './types.js';
+import { DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MEDIA_QUALITY, fetchBookmarkMediaBatch, parseMediaQuality } from './bookmark-media.js';
+import type { MediaQuality } from './bookmark-media.js';
 import type { MediaFetchManifest, MediaFetchProgress } from './bookmark-media.js';
+import { exportReadableBookmarkArchive } from './bookmark-folder-export.js';
 import {
   buildIndex,
   searchBookmarks,
@@ -33,7 +35,8 @@ import { exportBookmarks } from './md-export.js';
 import { renderViz } from './bookmarks-viz.js';
 import { listBrowserIds } from './browsers.js';
 import { configureHttpProxyFromEnv } from './http-proxy.js';
-import { dataDir, ensureDataDir, isFirstRun, migrateLegacyIdeasData, twitterBookmarksIndexPath, twitterBackfillStatePath, mdDir, bookmarkMediaDir, bookmarkMediaManifestPath } from './paths.js';
+import { dataDir, ensureDataDir, isFirstRun, migrateLegacyIdeasData, twitterBookmarksIndexPath, twitterBackfillStatePath, mdDir, bookmarkMediaDir, bookmarkMediaManifestPath, readableArchiveDir } from './paths.js';
+import { configureHttpSafety, httpSafetyAuditPath } from './http-safety.js';
 import { PromptCancelledError, promptText } from './prompt.js';
 import { skillWithFrontmatter, installSkill, uninstallSkill } from './skill.js';
 import { registerCompanionCommands } from './companion-cli.js';
@@ -210,6 +213,9 @@ const FRIENDLY_STOP_REASONS: Record<string, string> = {
   'max runtime reached': 'Paused after 30 minutes. Run again to continue.',
   'max pages reached': 'Paused after reaching page limit. Run again to continue.',
   'rate limited': 'Paused by X rate limiting.',
+  'request budget reached': 'Paused after reaching the configured HTTP request budget.',
+  'hourly request budget reached': 'Paused after reaching the configured hourly HTTP request budget.',
+  'rate limit floor reached': 'Paused before draining the remaining X rate-limit budget.',
   'target additions reached': 'Reached target bookmark count.',
   'interrupted': 'Interrupted by user.',
 };
@@ -232,6 +238,83 @@ function formatRetryAfter(seconds?: number): string | undefined {
   return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
 }
 
+const DEFAULT_TIMELINE_DELAY_MS = 2000;
+const DEFAULT_FOLDER_DELAY_MS = 3000;
+const DEFAULT_EXPANSION_DELAY_MS = 5000;
+const DEFAULT_MEDIA_DELAY_MS = 2000;
+
+function parseNonNegativeInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError('value must be a non-negative integer');
+  }
+  return parsed;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function resolveDelayMs(value: unknown, fallback: number): number {
+  return optionalNumber(value) ?? fallback;
+}
+
+function collectOptionValue(value: string, previous: string[] = []): string[] {
+  return [...previous, value];
+}
+
+function normalizeOptionStrings(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
+  if (typeof value === 'string' && value.trim()) return [value.trim()];
+  return [];
+}
+
+function formatFolderRetryCommand(folderNames: string[]): string {
+  if (folderNames.length === 0) return 'ft sync --folders';
+  const args = folderNames.map((name) => `--folder ${JSON.stringify(name)}`).join(' ');
+  return `ft sync ${args}`;
+}
+
+function formatFolderIdRetryCommand(folderIds: string[]): string {
+  if (folderIds.length === 0) return 'ft sync --folders';
+  const args = folderIds.map((id) => `--folder-id ${JSON.stringify(id)}`).join(' ');
+  return `ft sync ${args}`;
+}
+
+function addHttpSafetyOptions(command: Command): Command {
+  return command
+    .option('--audit-http', 'Write redacted HTTP request/response metadata to logs/http-audit-YYYY-MM-DD.jsonl')
+    .option('--audit-http-body', 'Include capped, redacted response snippets in the HTTP audit log')
+    .option('--min-request-delay-ms <n>', 'Minimum spacing between controlled HTTP requests', parseNonNegativeInteger)
+    .option('--request-jitter-ms <n>', 'Random extra delay added to controlled HTTP requests', parseNonNegativeInteger)
+    .option('--request-budget <n>', 'Stop after N controlled HTTP requests in this run', parsePositiveInteger)
+    .option('--max-requests-per-hour <n>', 'Stop after N controlled HTTP requests in a rolling hour', parsePositiveInteger)
+    .option('--rate-limit-floor <n>', 'Stop when X reports remaining rate-limit count at or below N', parseNonNegativeInteger);
+}
+
+function configureHttpSafetyFromOptions(options: any, fallbackMinDelayMs: number): void {
+  const explicitMinDelay = optionalNumber(options.minRequestDelayMs);
+  const envMinDelayConfigured = process.env.FT_HTTP_MIN_DELAY_MS != null;
+  const minDelayMs = explicitMinDelay ?? (envMinDelayConfigured ? undefined : fallbackMinDelayMs);
+  const explicitJitter = optionalNumber(options.requestJitterMs);
+  const envJitterConfigured = process.env.FT_HTTP_JITTER_MS != null;
+  const jitterMs = explicitJitter
+    ?? (envJitterConfigured || minDelayMs == null ? undefined : Math.min(1000, Math.floor(minDelayMs * 0.2)));
+
+  configureHttpSafety({
+    auditHttp: options.auditHttp || options.auditHttpBody ? true : undefined,
+    auditHttpBody: options.auditHttpBody ? true : undefined,
+    minDelayMs,
+    jitterMs,
+    requestBudget: optionalNumber(options.requestBudget),
+    maxRequestsPerHour: optionalNumber(options.maxRequestsPerHour),
+    rateLimitFloor: optionalNumber(options.rateLimitFloor),
+  });
+
+  const auditPath = httpSafetyAuditPath();
+  if (auditPath) console.log(`  HTTP audit: ${auditPath}`);
+}
+
 function printMediaFetchSummary(result: MediaFetchManifest): void {
   if (result.processed === 0) {
     console.log('  ✓ No pending media assets found');
@@ -243,11 +326,14 @@ function printMediaFetchSummary(result: MediaFetchManifest): void {
   if (result.failed > 0) {
     console.log(`  ${result.failed} media assets failed`);
   }
+  if (result.stopReason) {
+    console.log(`  Paused media fetch: ${result.stopReason}`);
+  }
   console.log(`  ✓ Media: ${bookmarkMediaDir()}`);
   console.log(`  ✓ Manifest: ${bookmarkMediaManifestPath()}`);
 }
 
-async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; skipProfileImages?: boolean; retryFailed?: boolean } = {}): Promise<MediaFetchManifest> {
+async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; mediaQuality?: MediaQuality; skipProfileImages?: boolean; retryFailed?: boolean; folderNames?: string[] } = {}): Promise<MediaFetchManifest> {
   const startTime = Date.now();
   const controller = new AbortController();
   let lastMedia: MediaFetchProgress = {
@@ -269,8 +355,10 @@ async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: n
   const result = await runWithSpinner(spinner, () => fetchBookmarkMediaBatch({
     limit: options.limit,
     maxBytes: options.maxBytes,
+    mediaQuality: options.mediaQuality,
     skipProfileImages: options.skipProfileImages,
     retryFailed: options.retryFailed,
+    folderNames: options.folderNames,
     signal: controller.signal,
     onProgress: (progress: MediaFetchProgress) => {
       lastMedia = progress;
@@ -417,8 +505,9 @@ const WHATS_NEW: Record<string, string[]> = {
     'ft sync --gaps is now idempotent \u2014 second runs print "No gaps found" instead of re-fetching forever',
   ],
   '1.3.5': [
-    'ft sync --folders \u2014 sync X bookmark folder tags (read-only mirror)',
+    'ft sync --folders \u2014 sync X bookmark folder tags without removing historical captures',
     'ft sync --folder <name> \u2014 sync a single folder by name',
+    'ft sync --folder-id <id> \u2014 sync a single folder by X folder id',
     'ft list --folder <name> \u2014 filter bookmarks by folder',
     'ft folders \u2014 show folder distribution',
     'Security: SSRF fix in article enrichment (redirect chains now validated per hop)',
@@ -633,12 +722,33 @@ function formatQuotedTweetLines(quoted: QuotedTweetSnapshot): string[] {
   ];
 }
 
-export function formatFolderMirrorStats(stats: { added: number; tagged: number; untagged: number; unchanged: number }): string {
+function formatThreadTweetLines(tweet: ThreadTweetSnapshot): string[] {
+  const author = tweet.authorHandle ? `@${tweet.authorHandle}` : (tweet.authorName ?? 'thread tweet');
+  const date = tweet.postedAt ? ` · ${tweet.postedAt.slice(0, 10)}` : '';
+  const text = tweet.text.split(/\r?\n/).map((line) => `  | ${sanitizeForDisplay(line)}`);
+  return [
+    `  | ${sanitizeForDisplay(author)}${date}`,
+    ...text,
+    `  | ${tweet.url}`,
+  ];
+}
+
+function formatThreadSectionLines(title: string, tweets: ThreadTweetSnapshot[]): string[] {
+  if (tweets.length === 0) return [];
+  const lines = ['', title];
+  for (const tweet of tweets) {
+    lines.push(...formatThreadTweetLines(tweet), '');
+  }
+  return lines;
+}
+
+export function formatFolderMirrorStats(stats: { added: number; tagged: number; untagged: number; unchanged: number; retained?: number }): string {
   const parts: string[] = [];
   if (stats.added > 0) parts.push(`${stats.added} new`);
   if (stats.tagged > 0) parts.push(`${stats.tagged} tagged`);
   if (stats.untagged > 0) parts.push(`${stats.untagged} removed`);
   if (stats.unchanged > 0) parts.push(`${stats.unchanged} unchanged`);
+  if ((stats.retained ?? 0) > 0) parts.push(`${stats.retained} retained`);
   return parts.length > 0 ? parts.join(', ') : 'no changes';
 }
 
@@ -802,7 +912,7 @@ export function buildCli() {
 
   // ── sync ────────────────────────────────────────────────────────────────
 
-  program
+  addHttpSafetyOptions(program
     .command('sync')
     .description('Sync bookmarks from X into your local database')
     .option('--api', 'Use OAuth v2 API instead of Chrome session', false)
@@ -812,20 +922,35 @@ export function buildCli() {
     .option('--yes', 'Skip confirmation prompts', false)
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
     .option('--no-media', 'Skip downloading media assets after syncing (default: media is downloaded)')
+    .option('--media-limit <n>', 'Cap on pending bookmarks whose media gets fetched after sync (default: all)', (v: string) => Number(v))
     .option('--media-max-bytes <n>', 'Per-asset byte limit for media downloads (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
+    .option('--media-quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
+    .option('--article-limit <n>', 'Cap article page fetches during --gaps (default: all)', parseNonNegativeInteger)
+    .option('--articles-only', 'With --gaps, fetch article bodies only; skip quoted tweets and long-text expansion', false)
     .option('--skip-profile-images', 'Skip downloading author profile images', false)
     .option('--max-pages <n>', 'Max pages to fetch (default: unlimited)', (v: string) => Number(v))
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
-    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
+    .option('--delay-ms <n>', 'Delay between X requests in ms (default: 2000; folders: 3000; gaps/threads: 5000)', parseNonNegativeInteger)
     .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
     .option('--browser <name>', 'Browser to read session from (chrome, chromium, brave, firefox, ...)')
     .option('--cookies <values...>', 'Pass ct0 and auth_token directly (skips browser extraction)')
     .option('--chrome-user-data-dir <path>', 'Chrome-family user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome-family profile name')
     .option('--firefox-profile-dir <path>', 'Firefox profile directory')
-    .option('--folders', 'Also sync bookmark folder tags (mirrors X\u2019s current folder state)', false)
-    .option('--folder <name>', 'Sync only this folder (case-insensitive, supports unambiguous prefix)')
-    .addOption(engineOption())
+    .option('--folders', 'Also sync bookmark folder tags (archival; does not remove historical tags)', false)
+    .option(
+      '--folder <name>',
+      'Sync only this folder; repeat for a selected batch (case-insensitive, supports unambiguous prefix)',
+      collectOptionValue,
+    )
+    .option(
+      '--folder-id <id>',
+      'Sync only this folder id; repeat for a selected batch, including duplicate-name folders',
+      collectOptionValue,
+    )
+    .option('--prune-folder-tags', 'Remove folder tags that are missing from a complete X folder walk', false)
+    .option('--threads', 'Capture parent context and same-author thread continuations', false)
+    .addOption(engineOption()))
     .action(async (options) => {
       const firstRun = isFirstRun();
       if (firstRun) showSyncWelcome();
@@ -837,48 +962,137 @@ export function buildCli() {
           await resolveEngine({ override: engineOverride });
         }
 
+        const syncThreadsEnabled = Boolean(options.threads);
         const mutuallyExclusive = [options.rebuild, options.continue, options.gaps].filter(Boolean).length;
         if (mutuallyExclusive > 1) {
           console.error('  Error: --rebuild, --continue, and --gaps cannot be used together.');
           process.exitCode = 1;
           return;
         }
-
-        // Folder flags: --folders (all) and --folder <name> (one) are mutually exclusive.
-        const folderAll = Boolean(options.folders);
-        const folderName = options.folder ? String(options.folder) : undefined;
-        if (folderAll && folderName) {
-          console.error('  Error: --folders and --folder cannot be used together. Pick one.');
+        if (syncThreadsEnabled && options.gaps) {
+          console.error('  Error: --threads cannot be combined with --gaps yet. Run them separately.');
           process.exitCode = 1;
           return;
         }
-        const folderMode: 'off' | 'all' | 'one' = folderName ? 'one' : folderAll ? 'all' : 'off';
+
+        // Folder flags: --folders (all), --folder <name>, and --folder-id <id> are mutually exclusive.
+        const folderAll = Boolean(options.folders);
+        const folderNames = normalizeOptionStrings(options.folder);
+        const folderIds = normalizeOptionStrings(options.folderId);
+        const folderSelectors = [folderAll, folderNames.length > 0, folderIds.length > 0].filter(Boolean).length;
+        if (folderSelectors > 1) {
+          console.error('  Error: --folders, --folder, and --folder-id cannot be combined. Pick one.');
+          process.exitCode = 1;
+          return;
+        }
+        const folderMode: 'off' | 'all' | 'selected' | 'ids' = folderIds.length > 0 ? 'ids' : folderNames.length > 0 ? 'selected' : folderAll ? 'all' : 'off';
         if (folderMode !== 'off' && options.api) {
           console.error('  Error: Folder sync requires browser session (GraphQL). Remove --api.');
           process.exitCode = 1;
           return;
         }
+        if (syncThreadsEnabled && options.api) {
+          console.error('  Error: Thread sync requires browser session (GraphQL). Remove --api.');
+          process.exitCode = 1;
+          return;
+        }
         if (folderMode !== 'off' && options.gaps) {
-          console.error('  Error: --folders/--folder cannot be combined with --gaps. Run them separately.');
+          console.error('  Error: --folders/--folder/--folder-id cannot be combined with --gaps. Run them separately.');
           process.exitCode = 1;
           return;
         }
         // Commander sets options.media=false when --no-media is passed;
         // otherwise it's true by default.
         const downloadMedia = options.media !== false;
+        let mediaQuality: MediaQuality;
+        try {
+          mediaQuality = parseMediaQuality(options.mediaQuality);
+        } catch (error) {
+          console.error(`  Error: ${(error as Error).message}`);
+          process.exitCode = 1;
+          return;
+        }
+        const mediaLimit = typeof options.mediaLimit === 'number' && !Number.isNaN(options.mediaLimit)
+          ? options.mediaLimit
+          : undefined;
         const mediaMaxBytes = typeof options.mediaMaxBytes === 'number' && !Number.isNaN(options.mediaMaxBytes)
           ? options.mediaMaxBytes
           : DEFAULT_MEDIA_MAX_BYTES;
+        const timelineDelayMs = resolveDelayMs(options.delayMs, DEFAULT_TIMELINE_DELAY_MS);
+        const folderDelayMs = resolveDelayMs(options.delayMs, DEFAULT_FOLDER_DELAY_MS);
+        const expansionDelayMs = resolveDelayMs(options.delayMs, DEFAULT_EXPANSION_DELAY_MS);
+        const safetyDelayMs = syncThreadsEnabled || options.gaps
+          ? expansionDelayMs
+          : folderMode !== 'off'
+            ? folderDelayMs
+            : timelineDelayMs;
+        configureHttpSafetyFromOptions(options, safetyDelayMs);
+
         const postSyncMediaFetch = async (): Promise<void> => {
           if (!downloadMedia) return;
-          await runMediaFetchWithProgress({ maxBytes: mediaMaxBytes, skipProfileImages: Boolean(options.skipProfileImages) });
+          await runMediaFetchWithProgress({
+            limit: mediaLimit,
+            maxBytes: mediaMaxBytes,
+            mediaQuality,
+            skipProfileImages: Boolean(options.skipProfileImages),
+          });
+          console.log('');
+        };
+
+        const runThreadSync = async (cookieArgs: { csrfToken?: string; cookieHeader?: string }): Promise<void> => {
+          if (!syncThreadsEnabled) return;
+          const startTime = Date.now();
+          process.stderr.write(`\n  Expanding reply threads...\n`);
+          let lastProgress: ThreadSyncProgress = { done: 0, total: 0, contextFilled: 0, belowFilled: 0, emptyChecked: 0, failed: 0 };
+          const spinner = createSpinner(() => {
+            const p = lastProgress;
+            const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            const parts = [`${p.done}/${p.total} (${pct}%)`];
+            if (p.contextFilled) parts.push(`${p.contextFilled} context`);
+            if (p.belowFilled) parts.push(`${p.belowFilled} continuations`);
+            if (p.emptyChecked) parts.push(`${p.emptyChecked} empty`);
+            if (p.failed) parts.push(`${p.failed} failed`);
+            parts.push(`${elapsed}s`);
+            return parts.join(' \u2502 ');
+          });
+          let result;
+          try {
+            result = await runWithSpinner(spinner, () => syncThreads({
+              delayMs: expansionDelayMs,
+              browser: options.browser ? String(options.browser) : undefined,
+              chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+              chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+              firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
+              csrfToken: cookieArgs.csrfToken,
+              cookieHeader: cookieArgs.cookieHeader,
+              onProgress: (progress: ThreadSyncProgress) => {
+                lastProgress = progress;
+                spinner.update();
+              },
+            }));
+          } catch (err) {
+            console.error(`\n  Thread sync paused: ${(err as Error).message}`);
+            console.error('  Partial progress was saved. Re-run `ft sync --threads` later to resume.\n');
+            return;
+          }
+          if (result.total === 0) {
+            console.log('  No thread gaps found.');
+          } else {
+            if (result.contextFilled > 0) console.log(`  \u2713 ${result.contextFilled} bookmarks got parent context`);
+            if (result.belowFilled > 0) console.log(`  \u2713 ${result.belowFilled} bookmarks got same-author continuations`);
+            if (result.emptyChecked > 0) console.log(`  \u2713 ${result.emptyChecked} bookmarks checked with no thread continuation`);
+            if (result.failed > 0) console.log(`  ${result.failed} thread expansions failed`);
+          }
           console.log('');
         };
 
         // ── gaps mode: backfill missing data for existing bookmarks ──
         if (options.gaps) {
           const startTime = Date.now();
-          const opening = downloadMedia
+          const opening = options.articlesOnly
+            ? '  Filling article gaps...\n'
+            : downloadMedia
             ? '  Filling gaps (quoted tweets, truncated text, articles, media)...\n'
             : '  Filling gaps (quoted tweets, truncated text, articles)...\n';
           process.stderr.write(opening);
@@ -897,13 +1111,17 @@ export function buildCli() {
           });
           const { csrfToken: gapCsrfToken, cookieHeader: gapCookieHeader } = parseCookieOption(options.cookies);
           const result = await runWithSpinner(spinner, () => syncGaps({
-            delayMs: Number(options.delayMs) || 300,
+            delayMs: expansionDelayMs,
             browser: options.browser ? String(options.browser) : undefined,
             chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
             chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
             firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
             csrfToken: gapCsrfToken,
             cookieHeader: gapCookieHeader,
+            articleLimit: typeof options.articleLimit === 'number' && !Number.isNaN(options.articleLimit)
+              ? options.articleLimit
+              : undefined,
+            articlesOnly: Boolean(options.articlesOnly),
             onProgress: (progress: GapFillProgress) => {
               lastProgress = progress;
               spinner.update();
@@ -1026,7 +1244,7 @@ export function buildCli() {
             staleWhenNoNewRecords: continueWithoutCursor,
             maxPages: options.maxPages != null ? Number(options.maxPages) : undefined,
             targetAdds: typeof options.targetAdds === 'number' && !Number.isNaN(options.targetAdds) ? options.targetAdds : undefined,
-            delayMs: Number(options.delayMs) || 600,
+            delayMs: timelineDelayMs,
             maxMinutes: Number(options.maxMinutes) || 30,
             browser: options.browser ? String(options.browser) : undefined,
             csrfToken,
@@ -1077,8 +1295,10 @@ export function buildCli() {
                 chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
                 chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
                 firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
-                delayMs: Number(options.delayMs) || 600,
-                onlyFolderName: folderMode === 'one' ? folderName : undefined,
+                delayMs: folderDelayMs,
+                onlyFolderNames: folderMode === 'selected' ? folderNames : undefined,
+                onlyFolderIds: folderMode === 'ids' ? folderIds : undefined,
+                pruneMissingFolderTags: Boolean(options.pruneFolderTags),
                 onProgress: (status: FolderSyncProgress) => {
                   if (status.phase === 'walking' && status.folder) {
                     process.stderr.write(`  \u2192 ${sanitizeForDisplay(status.folder.name)}...\n`);
@@ -1102,7 +1322,11 @@ export function buildCli() {
                 for (const { folder, reason } of folderResult.skippedFolders) {
                   console.log(`  \u26a0 Skipped ${sanitizeForDisplay(folder.name)}: ${reason}`);
                 }
-                const retryCmd = folderMode === 'one' ? `ft sync --folder "${folderName}"` : `ft sync --folders`;
+                const retryCmd = folderMode === 'selected'
+                  ? formatFolderRetryCommand(folderNames)
+                  : folderMode === 'ids'
+                    ? formatFolderIdRetryCommand(folderIds)
+                    : `ft sync --folders`;
                 console.log(`  Re-run \`${retryCmd}\` to retry.`);
               }
 
@@ -1117,6 +1341,8 @@ export function buildCli() {
               // Continue — main sync already succeeded, folders are bonus
             }
           }
+
+          await runThreadSync({ csrfToken, cookieHeader });
 
           await postSyncMediaFetch();
 
@@ -1279,6 +1505,12 @@ export function buildCli() {
       console.log(`${item.id} \u00b7 ${item.authorHandle ? `@${item.authorHandle}` : '@?'}`);
       console.log(item.url);
       console.log(item.text);
+      if (item.threadContext.length) {
+        console.log(formatThreadSectionLines('thread context', item.threadContext).join('\n'));
+      }
+      if (item.threadBelow.length) {
+        console.log(formatThreadSectionLines('thread continuation', item.threadBelow).join('\n'));
+      }
       if (item.quotedTweet) {
         console.log(formatQuotedTweetLines(item.quotedTweet).join('\n'));
       }
@@ -1943,22 +2175,28 @@ export function buildCli() {
 
   // ── fetch-media ─────────────────────────────────────────────────────────
 
-  program
+  addHttpSafetyOptions(program
     .command('fetch-media')
     .description('Download media assets for bookmarks')
     .option('--limit <n>', 'Max pending bookmarks to process (default: all)', (v: string) => Number(v))
     .option('--max-bytes <n>', 'Per-asset byte limit (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
+    .option('--quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
+    .option('--folder <name>', 'Only fetch media for this X bookmark folder; repeat for a selected batch', collectOptionValue)
     .option('--skip-profile-images', 'Skip downloading author profile images')
     .option('--retry-failed', 'Retry failed media entries without waiting for backoff')
+    .option('--delay-ms <n>', 'Minimum delay between media HTTP requests in ms (default: 2000)', parseNonNegativeInteger))
     .action(safe(async (options) => {
       if (!requireData()) return;
+      configureHttpSafetyFromOptions(options, resolveDelayMs(options.delayMs, DEFAULT_MEDIA_DELAY_MS));
       await runMediaFetchWithProgress({
         limit: typeof options.limit === 'number' && !Number.isNaN(options.limit) ? options.limit : undefined,
         maxBytes: typeof options.maxBytes === 'number' && !Number.isNaN(options.maxBytes)
           ? options.maxBytes
           : DEFAULT_MEDIA_MAX_BYTES,
+        mediaQuality: parseMediaQuality(options.quality),
         skipProfileImages: Boolean(options.skipProfileImages),
         retryFailed: Boolean(options.retryFailed),
+        folderNames: normalizeOptionStrings(options.folder),
       });
     }));
 
@@ -1992,6 +2230,29 @@ export function buildCli() {
       console.log(`Exported ${result.exported}/${result.total} bookmarks${skippedNote}`);
       console.log(`  ${result.elapsed}s elapsed`);
       console.log(`\n  Open in your markdown viewer:\n  ${mdDir()}`);
+    }));
+
+  program
+    .command('archive-md')
+    .description('Export bookmarks into foldered markdown archive with local media links')
+    .option('--clean', 'Remove the previous generated readable archive before exporting')
+    .option('--no-unfiled', 'Skip bookmarks that are not currently tagged with a folder')
+    .action(safe(async (options) => {
+      if (!requireData()) return;
+      let lastLine = '';
+      const spinner = createSpinner(() => lastLine);
+      const result = await exportReadableBookmarkArchive({
+        clean: Boolean(options.clean),
+        includeUnfiled: options.unfiled !== false,
+        onProgress: (s) => {
+          lastLine = s;
+          spinner.update();
+        },
+      });
+      spinner.stop();
+      console.log(`Exported ${result.records} bookmark placements across ${result.folders} folders`);
+      console.log(`  ${result.filesWritten} markdown files written`);
+      console.log(`\n  Open in your markdown viewer:\n  ${readableArchiveDir()}`);
     }));
 
   // ── ft wiki ── Compile Karpathy-style knowledge base ────────────────────
