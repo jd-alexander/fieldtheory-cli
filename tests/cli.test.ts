@@ -398,6 +398,9 @@ test('ft sync: media is on by default and exposes --no-media', () => {
   assert.ok(syncCmd.options.some((o: any) => o.long === '--audit-http'));
   assert.ok(syncCmd.options.some((o: any) => o.long === '--request-budget'));
   assert.ok(syncCmd.options.some((o: any) => o.long === '--rate-limit-floor'));
+  const folderOption = syncCmd.options.find((o: any) => o.long === '--folder');
+  assert.ok(folderOption);
+  assert.match(folderOption.description, /repeat/i);
 });
 
 test('ft fetch-media exposes media quality option', () => {

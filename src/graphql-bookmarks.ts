@@ -1340,6 +1340,12 @@ export interface FolderSyncOptions {
    * exact-match, then unambiguous prefix).
    */
   onlyFolderName?: string;
+  /**
+   * If set, sync only the folders matching these display names.
+   * Names are resolved in order against the fetched folder list and duplicate
+   * folder ids are ignored.
+   */
+  onlyFolderNames?: string[];
   delayMs?: number;
   onProgress?: (status: FolderSyncProgress) => void;
 }
@@ -1360,6 +1366,56 @@ export interface FolderSyncResult {
   totalUntagged: number;
   skippedFolders: Array<{ folder: BookmarkFolder; reason: string }>;
   orphanFoldersCleared: Array<{ folderId: string; recordsAffected: number }>;
+}
+
+function resolveBookmarkFolderByName(allFolders: BookmarkFolder[], query: string): BookmarkFolder {
+  const lower = query.trim().toLowerCase();
+  const exact = allFolders.find((f) => f.name.trim().toLowerCase() === lower);
+  if (exact) return exact;
+
+  const prefix = allFolders.filter((f) => f.name.trim().toLowerCase().startsWith(lower));
+  if (prefix.length === 1) return prefix[0];
+  if (prefix.length > 1) {
+    const matches = prefix.map((f) => f.name).join(', ');
+    throw new Error(`No folder matches "${query}". Multiple matches: ${matches}. Be more specific.`);
+  }
+
+  const available = allFolders.map((f) => f.name).join(', ') || '(none)';
+  throw new Error(`No folder matches "${query}". Available: ${available}`);
+}
+
+export function resolveBookmarkFolderTargets(
+  allFolders: BookmarkFolder[],
+  options: Pick<FolderSyncOptions, 'onlyFolderId' | 'onlyFolderName' | 'onlyFolderNames'> = {},
+): BookmarkFolder[] {
+  if (options.onlyFolderId) {
+    const match = allFolders.find((f) => f.id === options.onlyFolderId);
+    if (!match) {
+      throw new Error(
+        `Folder "${options.onlyFolderName ?? options.onlyFolderId}" not found on X. ` +
+          `Available: ${allFolders.map((f) => f.name).join(', ') || '(none)'}`
+      );
+    }
+    return [match];
+  }
+
+  const requestedNames = [
+    ...(options.onlyFolderName ? [options.onlyFolderName] : []),
+    ...(options.onlyFolderNames ?? []),
+  ].map((name) => name.trim()).filter(Boolean);
+
+  if (requestedNames.length === 0) return allFolders;
+
+  const seenIds = new Set<string>();
+  const resolved: BookmarkFolder[] = [];
+  for (const name of requestedNames) {
+    const folder = resolveBookmarkFolderByName(allFolders, name);
+    if (seenIds.has(folder.id)) continue;
+    seenIds.add(folder.id);
+    resolved.push(folder);
+  }
+
+  return resolved;
 }
 
 export interface BookmarkFolderStateEntry {
@@ -1545,33 +1601,7 @@ export async function syncBookmarkFolders(
   let folderState = mergeFolderInventoryState(await loadFolderSyncState(folderStatePath), allFolders, listedAt);
   await writeJson(folderStatePath, folderState);
 
-  let targetFolders: BookmarkFolder[];
-  if (options.onlyFolderId) {
-    const match = allFolders.find((f) => f.id === options.onlyFolderId);
-    if (!match) {
-      throw new Error(
-        `Folder "${options.onlyFolderName ?? options.onlyFolderId}" not found on X. ` +
-          `Available: ${allFolders.map((f) => f.name).join(', ') || '(none)'}`
-      );
-    }
-    targetFolders = [match];
-  } else if (options.onlyFolderName) {
-    // Resolve name against fetched list: exact match (case-insensitive) > unambiguous prefix.
-    // Trim whitespace so `ft sync --folder " Coding "` works the same as `--folder Coding`.
-    const lower = options.onlyFolderName.trim().toLowerCase();
-    const exact = allFolders.find((f) => f.name.trim().toLowerCase() === lower);
-    const prefix = allFolders.filter((f) => f.name.trim().toLowerCase().startsWith(lower));
-    const resolved = exact ?? (prefix.length === 1 ? prefix[0] : undefined);
-    if (!resolved) {
-      const hint = prefix.length > 1
-        ? `Multiple matches: ${prefix.map((f) => f.name).join(', ')}. Be more specific.`
-        : `Available: ${allFolders.map((f) => f.name).join(', ') || '(none)'}`;
-      throw new Error(`No folder matches "${options.onlyFolderName}". ${hint}`);
-    }
-    targetFolders = [resolved];
-  } else {
-    targetFolders = allFolders;
-  }
+  const targetFolders = resolveBookmarkFolderTargets(allFolders, options);
 
   const perFolder: Array<{ folder: BookmarkFolder; stats: FolderMirrorStats | null; skipped?: string }> = [];
   const skippedFolders: Array<{ folder: BookmarkFolder; reason: string }> = [];

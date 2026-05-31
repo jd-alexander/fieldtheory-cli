@@ -258,6 +258,22 @@ function resolveDelayMs(value: unknown, fallback: number): number {
   return optionalNumber(value) ?? fallback;
 }
 
+function collectOptionValue(value: string, previous: string[] = []): string[] {
+  return [...previous, value];
+}
+
+function normalizeOptionStrings(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
+  if (typeof value === 'string' && value.trim()) return [value.trim()];
+  return [];
+}
+
+function formatFolderRetryCommand(folderNames: string[]): string {
+  if (folderNames.length === 0) return 'ft sync --folders';
+  const args = folderNames.map((name) => `--folder ${JSON.stringify(name)}`).join(' ');
+  return `ft sync ${args}`;
+}
+
 function addHttpSafetyOptions(command: Command): Command {
   return command
     .option('--audit-http', 'Write redacted HTTP request/response metadata to logs/http-audit-YYYY-MM-DD.jsonl')
@@ -910,7 +926,11 @@ export function buildCli() {
     .option('--chrome-profile-directory <name>', 'Chrome-family profile name')
     .option('--firefox-profile-dir <path>', 'Firefox profile directory')
     .option('--folders', 'Also sync bookmark folder tags (mirrors X\u2019s current folder state)', false)
-    .option('--folder <name>', 'Sync only this folder (case-insensitive, supports unambiguous prefix)')
+    .option(
+      '--folder <name>',
+      'Sync only this folder; repeat for a selected batch (case-insensitive, supports unambiguous prefix)',
+      collectOptionValue,
+    )
     .option('--threads', 'Capture parent context and same-author thread continuations', false)
     .addOption(engineOption()))
     .action(async (options) => {
@@ -937,15 +957,15 @@ export function buildCli() {
           return;
         }
 
-        // Folder flags: --folders (all) and --folder <name> (one) are mutually exclusive.
+        // Folder flags: --folders (all) and --folder <name> (selected batch) are mutually exclusive.
         const folderAll = Boolean(options.folders);
-        const folderName = options.folder ? String(options.folder) : undefined;
-        if (folderAll && folderName) {
+        const folderNames = normalizeOptionStrings(options.folder);
+        if (folderAll && folderNames.length > 0) {
           console.error('  Error: --folders and --folder cannot be used together. Pick one.');
           process.exitCode = 1;
           return;
         }
-        const folderMode: 'off' | 'all' | 'one' = folderName ? 'one' : folderAll ? 'all' : 'off';
+        const folderMode: 'off' | 'all' | 'selected' = folderNames.length > 0 ? 'selected' : folderAll ? 'all' : 'off';
         if (folderMode !== 'off' && options.api) {
           console.error('  Error: Folder sync requires browser session (GraphQL). Remove --api.');
           process.exitCode = 1;
@@ -1250,7 +1270,7 @@ export function buildCli() {
                 chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
                 firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
                 delayMs: folderDelayMs,
-                onlyFolderName: folderMode === 'one' ? folderName : undefined,
+                onlyFolderNames: folderMode === 'selected' ? folderNames : undefined,
                 onProgress: (status: FolderSyncProgress) => {
                   if (status.phase === 'walking' && status.folder) {
                     process.stderr.write(`  \u2192 ${sanitizeForDisplay(status.folder.name)}...\n`);
@@ -1274,7 +1294,7 @@ export function buildCli() {
                 for (const { folder, reason } of folderResult.skippedFolders) {
                   console.log(`  \u26a0 Skipped ${sanitizeForDisplay(folder.name)}: ${reason}`);
                 }
-                const retryCmd = folderMode === 'one' ? `ft sync --folder "${folderName}"` : `ft sync --folders`;
+                const retryCmd = folderMode === 'selected' ? formatFolderRetryCommand(folderNames) : `ft sync --folders`;
                 console.log(`  Re-run \`${retryCmd}\` to retry.`);
               }
 

@@ -23,6 +23,7 @@ import {
   formatSyncResult,
   hashFolderRecordIds,
   mergeFolderInventoryState,
+  resolveBookmarkFolderTargets,
   syncBookmarksGraphQL,
   syncGaps,
   syncThreads,
@@ -2433,6 +2434,24 @@ test('resolveFolder: trims whitespace on both sides', () => {
 test('resolveFolder: trims whitespace on folder names too', () => {
   const padded: BookmarkFolder[] = [{ id: 'fx', name: '  Spaced  ' }];
   assert.equal(resolveFolder(padded, 'spaced').id, 'fx');
+});
+
+test('resolveBookmarkFolderTargets: resolves a selected folder batch in request order', () => {
+  const resolved = resolveBookmarkFolderTargets(FOLDERS, {
+    onlyFolderNames: ['Music', 'Coding'],
+  });
+  assert.deepEqual(resolved.map((folder) => folder.id), ['f4', 'f1']);
+});
+
+test('resolveBookmarkFolderTargets: dedupes repeated folder names', () => {
+  const resolved = resolveBookmarkFolderTargets(FOLDERS, {
+    onlyFolderNames: ['Coding', 'cod', '  Coding  '],
+  });
+  assert.deepEqual(resolved.map((folder) => folder.id), ['f1']);
+});
+
+test('resolveBookmarkFolderTargets: defaults to all folders when no filter is set', () => {
+  assert.deepEqual(resolveBookmarkFolderTargets(FOLDERS).map((folder) => folder.id), ['f1', 'f2', 'f3', 'f4']);
 });
 
 // ── withoutFolder dedup (M1) ───────────────────────────────────────────
