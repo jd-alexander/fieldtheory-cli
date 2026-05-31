@@ -17,6 +17,7 @@ import {
   scoreRecord,
   mergeBookmarkRecord,
   mergeRecords,
+  applyFolderArchive,
   applyFolderMirror,
   clearFolderEverywhere,
   fetchBookmarkFolders,
@@ -2202,6 +2203,39 @@ test('applyFolderMirror: tags records in the walked set', () => {
   assert.deepEqual(record2.folderIds ?? [], []);
 });
 
+test('applyFolderArchive: retains historical folder tags for records missing from latest walk', () => {
+  const existing = [
+    makeRecord({ id: '1', tweetId: '1', folderIds: ['f-coding'], folderNames: ['Coding'] }),
+    makeRecord({ id: '2', tweetId: '2', folderIds: ['f-coding'], folderNames: ['Coding'] }),
+  ];
+  const walked = [makeRecord({ id: '1', tweetId: '1', text: 'Updated' })];
+
+  const { merged, stats } = applyFolderArchive(existing, CODING_FOLDER, walked);
+
+  assert.equal(stats.untagged, 0);
+  assert.equal(stats.retained, 1);
+  assert.equal(stats.unchanged, 1);
+  const record1 = merged.find((r) => r.id === '1')!;
+  const record2 = merged.find((r) => r.id === '2')!;
+  assert.equal(record1.text, 'Updated');
+  assert.deepEqual(record1.folderIds, ['f-coding']);
+  assert.deepEqual(record2.folderIds, ['f-coding']);
+  assert.deepEqual(record2.folderNames, ['Coding']);
+});
+
+test('applyFolderArchive: empty complete folder walks do not erase captured folder membership', () => {
+  const existing = [
+    makeRecord({ id: '1', tweetId: '1', folderIds: ['f-coding'], folderNames: ['Coding'] }),
+  ];
+
+  const { merged, stats } = applyFolderArchive(existing, CODING_FOLDER, []);
+
+  assert.equal(stats.untagged, 0);
+  assert.equal(stats.retained, 1);
+  assert.deepEqual(merged[0].folderIds, ['f-coding']);
+  assert.deepEqual(merged[0].folderNames, ['Coding']);
+});
+
 test('applyFolderMirror: removes folder tag from records NOT in walked set (mirror semantics)', () => {
   const existing = [
     makeRecord({ id: '1', tweetId: '1', folderIds: ['f-coding'], folderNames: ['Coding'] }),
@@ -2373,6 +2407,29 @@ test('main-sync merge preserves folder tags on existing records', () => {
   assert.deepEqual(merged[0].folderNames, ['Coding']);
 });
 
+test('mergeBookmarkRecord: empty incoming folder arrays do not erase captured folder tags', () => {
+  const existing = makeRecord({
+    id: '1',
+    tweetId: '1',
+    folderIds: ['f-coding'],
+    folderNames: ['Coding'],
+  });
+  const incoming = makeRecord({
+    id: '1',
+    tweetId: '1',
+    text: 'Updated richer record',
+    folderIds: [],
+    folderNames: [],
+    mediaObjects: [{ url: 'https://example.com/image.jpg', type: 'photo' }],
+  });
+
+  const merged = mergeBookmarkRecord(existing, incoming);
+
+  assert.equal(merged.text, 'Updated richer record');
+  assert.deepEqual(merged.folderIds, ['f-coding']);
+  assert.deepEqual(merged.folderNames, ['Coding']);
+});
+
 // ── resolveFolder helper ───────────────────────────────────────────────
 
 const FOLDERS: BookmarkFolder[] = [
@@ -2414,6 +2471,13 @@ test('formatFolderMirrorStats: shows only non-zero fields', () => {
   assert.equal(
     formatFolderMirrorStats({ added: 3, tagged: 5, untagged: 0, unchanged: 10 }),
     '3 new, 5 tagged, 10 unchanged',
+  );
+});
+
+test('formatFolderMirrorStats: shows retained historical folder records', () => {
+  assert.equal(
+    formatFolderMirrorStats({ added: 0, tagged: 1, untagged: 0, unchanged: 2, retained: 3 }),
+    '1 tagged, 2 unchanged, 3 retained',
   );
 });
 

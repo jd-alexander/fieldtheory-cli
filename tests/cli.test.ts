@@ -401,6 +401,7 @@ test('ft sync: media is on by default and exposes --no-media', () => {
   const folderOption = syncCmd.options.find((o: any) => o.long === '--folder');
   assert.ok(folderOption);
   assert.match(folderOption.description, /repeat/i);
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--prune-folder-tags'));
 });
 
 test('ft fetch-media exposes media quality option', () => {

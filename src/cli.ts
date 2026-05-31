@@ -498,7 +498,7 @@ const WHATS_NEW: Record<string, string[]> = {
     'ft sync --gaps is now idempotent \u2014 second runs print "No gaps found" instead of re-fetching forever',
   ],
   '1.3.5': [
-    'ft sync --folders \u2014 sync X bookmark folder tags (read-only mirror)',
+    'ft sync --folders \u2014 sync X bookmark folder tags without removing historical captures',
     'ft sync --folder <name> \u2014 sync a single folder by name',
     'ft list --folder <name> \u2014 filter bookmarks by folder',
     'ft folders \u2014 show folder distribution',
@@ -734,12 +734,13 @@ function formatThreadSectionLines(title: string, tweets: ThreadTweetSnapshot[]):
   return lines;
 }
 
-export function formatFolderMirrorStats(stats: { added: number; tagged: number; untagged: number; unchanged: number }): string {
+export function formatFolderMirrorStats(stats: { added: number; tagged: number; untagged: number; unchanged: number; retained?: number }): string {
   const parts: string[] = [];
   if (stats.added > 0) parts.push(`${stats.added} new`);
   if (stats.tagged > 0) parts.push(`${stats.tagged} tagged`);
   if (stats.untagged > 0) parts.push(`${stats.untagged} removed`);
   if (stats.unchanged > 0) parts.push(`${stats.unchanged} unchanged`);
+  if ((stats.retained ?? 0) > 0) parts.push(`${stats.retained} retained`);
   return parts.length > 0 ? parts.join(', ') : 'no changes';
 }
 
@@ -926,12 +927,13 @@ export function buildCli() {
     .option('--chrome-user-data-dir <path>', 'Chrome-family user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome-family profile name')
     .option('--firefox-profile-dir <path>', 'Firefox profile directory')
-    .option('--folders', 'Also sync bookmark folder tags (mirrors X\u2019s current folder state)', false)
+    .option('--folders', 'Also sync bookmark folder tags (archival; does not remove historical tags)', false)
     .option(
       '--folder <name>',
       'Sync only this folder; repeat for a selected batch (case-insensitive, supports unambiguous prefix)',
       collectOptionValue,
     )
+    .option('--prune-folder-tags', 'Remove folder tags that are missing from a complete X folder walk', false)
     .option('--threads', 'Capture parent context and same-author thread continuations', false)
     .addOption(engineOption()))
     .action(async (options) => {
@@ -1272,6 +1274,7 @@ export function buildCli() {
                 firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
                 delayMs: folderDelayMs,
                 onlyFolderNames: folderMode === 'selected' ? folderNames : undefined,
+                pruneMissingFolderTags: Boolean(options.pruneFolderTags),
                 onProgress: (status: FolderSyncProgress) => {
                   if (status.phase === 'walking' && status.folder) {
                     process.stderr.write(`  \u2192 ${sanitizeForDisplay(status.folder.name)}...\n`);

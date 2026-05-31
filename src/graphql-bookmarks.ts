@@ -629,6 +629,10 @@ export function mergeBookmarkRecord(existing: BookmarkRecord | undefined, incomi
   if ((existing.media?.length ?? 0) > 0 && (incoming.media?.length ?? 0) === 0) {
     merged.media = existing.media;
   }
+  if ((existing.folderIds?.length ?? 0) > 0 && (incoming.folderIds?.length ?? 0) === 0) {
+    merged.folderIds = existing.folderIds;
+    merged.folderNames = existing.folderNames;
+  }
 
   return merged;
 }
@@ -1197,6 +1201,7 @@ export interface FolderMirrorStats {
   tagged: number;    // existing records that gained this folder tag
   untagged: number;  // existing records that lost this folder tag
   unchanged: number; // records that already had the tag and still do
+  retained?: number; // archival mode: previously tagged records missing from latest walk but kept
 }
 
 /**
@@ -1309,6 +1314,53 @@ export function applyFolderMirror(
 }
 
 /**
+ * Apply a folder walk as archive evidence.
+ *
+ * This is the default daily-sync behavior. It is deliberately non-destructive:
+ * records in the latest walk gain/keep the folder tag, while records that were
+ * previously captured in the folder keep that historical tag even if X no
+ * longer returns them. Use applyFolderMirror only for explicit pruning.
+ */
+export function applyFolderArchive(
+  existing: BookmarkRecord[],
+  folder: BookmarkFolder,
+  walkedRecords: BookmarkRecord[],
+): { merged: BookmarkRecord[]; stats: FolderMirrorStats } {
+  const byId = new Map(existing.map((r) => [r.id, r]));
+  const walkedIds = new Set(walkedRecords.map((r) => r.id));
+
+  let added = 0;
+  let tagged = 0;
+  let unchanged = 0;
+  let retained = 0;
+
+  for (const [id, record] of byId) {
+    if (walkedIds.has(id)) continue;
+    if ((record.folderIds ?? []).includes(folder.id)) retained += 1;
+  }
+
+  for (const walked of walkedRecords) {
+    const prev = byId.get(walked.id);
+
+    if (!prev) {
+      byId.set(walked.id, withFolder(walked, folder));
+      added += 1;
+      continue;
+    }
+
+    const wasTagged = (prev.folderIds ?? []).includes(folder.id);
+    const base = mergeBookmarkRecord(prev, walked);
+    byId.set(walked.id, withFolder(base, folder));
+    if (wasTagged) unchanged += 1;
+    else tagged += 1;
+  }
+
+  const merged = Array.from(byId.values());
+  merged.sort((a, b) => compareBookmarkChronology(b, a));
+  return { merged, stats: { added, tagged, untagged: 0, unchanged, retained } };
+}
+
+/**
  * Remove a folder tag from every record. Used for orphan cleanup when a
  * folder has been deleted on X.
  */
@@ -1346,6 +1398,12 @@ export interface FolderSyncOptions {
    * folder ids are ignored.
    */
   onlyFolderNames?: string[];
+  /**
+   * Destructive mirror mode. When true, folder tags missing from a complete X
+   * walk are removed locally, and tags for folders missing from X are cleared.
+   * Default is archival mode, which never removes previously captured tags.
+   */
+  pruneMissingFolderTags?: boolean;
   delayMs?: number;
   onProgress?: (status: FolderSyncProgress) => void;
 }
@@ -1635,12 +1693,12 @@ export async function syncBookmarkFolders(
       continue;
     }
 
-    // A complete walk with 0 records is a legitimate state: the user may have
-    // intentionally emptied the folder on X. Mirror semantics require us to
-    // clear any prior tags for this folder. We rely on walkFolderTimeline's
-    // `complete: true` signal — not a heuristic about prior state — to know
-    // the walk is authoritative.
-    const mirror = applyFolderMirror(existing, folder, walkResult.records);
+    // By default folder sync is archival: a complete walk with 0 records does
+    // not erase the historical folder tag from records already captured. Pass
+    // pruneMissingFolderTags for explicit mirror/prune semantics.
+    const mirror = options.pruneMissingFolderTags
+      ? applyFolderMirror(existing, folder, walkResult.records)
+      : applyFolderArchive(existing, folder, walkResult.records);
     existing = mirror.merged;
     perFolder.push({ folder, stats: mirror.stats });
     totalAdded += mirror.stats.added;
@@ -1666,9 +1724,11 @@ export async function syncBookmarkFolders(
     }
   }
 
-  // Orphan cleanup: only on full sync (not single-folder mode).
+  // Orphan cleanup is destructive, so it only runs in explicit prune mode on
+  // full folder sync. Daily archive sync preserves tags for folders that
+  // disappear from X until the user intentionally prunes them.
   const orphanFoldersCleared: Array<{ folderId: string; recordsAffected: number }> = [];
-  if (!options.onlyFolderId) {
+  if (options.pruneMissingFolderTags && !options.onlyFolderId && !options.onlyFolderName && !options.onlyFolderNames?.length) {
     const currentFolderIds = new Set(allFolders.map((f) => f.id));
     const knownTaggedIds = new Set<string>();
     for (const r of existing) {
