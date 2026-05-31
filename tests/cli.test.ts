@@ -412,6 +412,14 @@ test('ft fetch-media exposes media quality option', () => {
   assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--request-budget'));
 });
 
+test('ft archive-md command is registered', () => {
+  const program = buildCli();
+  const archiveCmd = program.commands.find((c: any) => c.name() === 'archive-md');
+  assert.ok(archiveCmd, 'archive-md command should be registered');
+  assert.ok(archiveCmd.options.some((o: any) => o.long === '--clean'));
+  assert.ok(archiveCmd.options.some((o: any) => o.long === '--no-unfiled'));
+});
+
 test('ft wiki: description mentions engine prerequisite', () => {
   const program = buildCli();
   const wikiCmd = program.commands.find((c: any) => c.name() === 'wiki');

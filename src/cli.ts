@@ -9,6 +9,7 @@ import type { BookmarkFolder, QuotedTweetSnapshot, ThreadTweetSnapshot } from '.
 import { DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MEDIA_QUALITY, fetchBookmarkMediaBatch, parseMediaQuality } from './bookmark-media.js';
 import type { MediaQuality } from './bookmark-media.js';
 import type { MediaFetchManifest, MediaFetchProgress } from './bookmark-media.js';
+import { exportReadableBookmarkArchive } from './bookmark-folder-export.js';
 import {
   buildIndex,
   searchBookmarks,
@@ -34,7 +35,7 @@ import { exportBookmarks } from './md-export.js';
 import { renderViz } from './bookmarks-viz.js';
 import { listBrowserIds } from './browsers.js';
 import { configureHttpProxyFromEnv } from './http-proxy.js';
-import { dataDir, ensureDataDir, isFirstRun, migrateLegacyIdeasData, twitterBookmarksIndexPath, twitterBackfillStatePath, mdDir, bookmarkMediaDir, bookmarkMediaManifestPath } from './paths.js';
+import { dataDir, ensureDataDir, isFirstRun, migrateLegacyIdeasData, twitterBookmarksIndexPath, twitterBackfillStatePath, mdDir, bookmarkMediaDir, bookmarkMediaManifestPath, readableArchiveDir } from './paths.js';
 import { configureHttpSafety, httpSafetyAuditPath } from './http-safety.js';
 import { PromptCancelledError, promptText } from './prompt.js';
 import { skillWithFrontmatter, installSkill, uninstallSkill } from './skill.js';
@@ -2196,6 +2197,29 @@ export function buildCli() {
       console.log(`Exported ${result.exported}/${result.total} bookmarks${skippedNote}`);
       console.log(`  ${result.elapsed}s elapsed`);
       console.log(`\n  Open in your markdown viewer:\n  ${mdDir()}`);
+    }));
+
+  program
+    .command('archive-md')
+    .description('Export bookmarks into foldered markdown archive with local media links')
+    .option('--clean', 'Remove the previous generated readable archive before exporting')
+    .option('--no-unfiled', 'Skip bookmarks that are not currently tagged with a folder')
+    .action(safe(async (options) => {
+      if (!requireData()) return;
+      let lastLine = '';
+      const spinner = createSpinner(() => lastLine);
+      const result = await exportReadableBookmarkArchive({
+        clean: Boolean(options.clean),
+        includeUnfiled: options.unfiled !== false,
+        onProgress: (s) => {
+          lastLine = s;
+          spinner.update();
+        },
+      });
+      spinner.stop();
+      console.log(`Exported ${result.records} bookmark placements across ${result.folders} folders`);
+      console.log(`  ${result.filesWritten} markdown files written`);
+      console.log(`\n  Open in your markdown viewer:\n  ${readableArchiveDir()}`);
     }));
 
   // ── ft wiki ── Compile Karpathy-style knowledge base ────────────────────

@@ -108,6 +108,10 @@ export function bookmarkMediaManifestPath(): string {
   return path.join(dataDir(), 'media-manifest.json');
 }
 
+export function readableArchiveDir(): string {
+  return path.join(dataDir(), 'readable');
+}
+
 export function httpAuditLogDir(): string {
   return path.join(dataDir(), 'logs');
 }
