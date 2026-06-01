@@ -939,6 +939,11 @@ export function buildCli() {
     .option('--firefox-profile-dir <path>', 'Firefox profile directory')
     .option('--folders', 'Also sync bookmark folder tags (archival; does not remove historical tags)', false)
     .option(
+      '--recent-folders <n>',
+      'After the raw timeline sync, sync the first N folders from X folder order and stop once pending untagged bookmarks are tagged',
+      parsePositiveInteger,
+    )
+    .option(
       '--folder <name>',
       'Sync only this folder; repeat for a selected batch (case-insensitive, supports unambiguous prefix)',
       collectOptionValue,
@@ -975,17 +980,20 @@ export function buildCli() {
           return;
         }
 
-        // Folder flags: --folders (all), --folder <name>, and --folder-id <id> are mutually exclusive.
+        // Folder flags: --folders (all), --recent-folders <n>, --folder <name>,
+        // and --folder-id <id> are mutually exclusive.
         const folderAll = Boolean(options.folders);
+        const recentFolderLimit = optionalNumber(options.recentFolders);
+        const folderRecent = recentFolderLimit != null;
         const folderNames = normalizeOptionStrings(options.folder);
         const folderIds = normalizeOptionStrings(options.folderId);
-        const folderSelectors = [folderAll, folderNames.length > 0, folderIds.length > 0].filter(Boolean).length;
+        const folderSelectors = [folderAll, folderRecent, folderNames.length > 0, folderIds.length > 0].filter(Boolean).length;
         if (folderSelectors > 1) {
-          console.error('  Error: --folders, --folder, and --folder-id cannot be combined. Pick one.');
+          console.error('  Error: --folders, --recent-folders, --folder, and --folder-id cannot be combined. Pick one.');
           process.exitCode = 1;
           return;
         }
-        const folderMode: 'off' | 'all' | 'selected' | 'ids' = folderIds.length > 0 ? 'ids' : folderNames.length > 0 ? 'selected' : folderAll ? 'all' : 'off';
+        const folderMode: 'off' | 'all' | 'recent' | 'selected' | 'ids' = folderIds.length > 0 ? 'ids' : folderNames.length > 0 ? 'selected' : folderRecent ? 'recent' : folderAll ? 'all' : 'off';
         if (folderMode !== 'off' && options.api) {
           console.error('  Error: Folder sync requires browser session (GraphQL). Remove --api.');
           process.exitCode = 1;
@@ -997,7 +1005,7 @@ export function buildCli() {
           return;
         }
         if (folderMode !== 'off' && options.gaps) {
-          console.error('  Error: --folders/--folder/--folder-id cannot be combined with --gaps. Run them separately.');
+          console.error('  Error: --folders/--recent-folders/--folder/--folder-id cannot be combined with --gaps. Run them separately.');
           process.exitCode = 1;
           return;
         }
@@ -1284,10 +1292,13 @@ export function buildCli() {
 
           warnIfEmpty(result.totalBookmarks);
 
-          // ── Folder sync (runs after main timeline when --folders is passed) ──
+          // ── Folder sync/reconciliation (runs after the raw timeline when requested) ──
           if (folderMode !== 'off') {
             try {
-              process.stderr.write(`\n  Syncing bookmark folders...\n`);
+              const opening = folderMode === 'recent'
+                ? `\n  Reconciling recent bookmark folders (${recentFolderLimit} max)...\n`
+                : `\n  Syncing bookmark folders...\n`;
+              process.stderr.write(opening);
               const folderResult = await syncBookmarkFolders({
                 csrfToken,
                 cookieHeader,
@@ -1296,6 +1307,9 @@ export function buildCli() {
                 chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
                 firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
                 delayMs: folderDelayMs,
+                folderLimit: folderMode === 'recent' ? recentFolderLimit : undefined,
+                stopWhenRecordIdsTagged: folderMode === 'recent' ? result.addedIds : undefined,
+                reconcileUntaggedRecords: folderMode === 'recent',
                 onlyFolderNames: folderMode === 'selected' ? folderNames : undefined,
                 onlyFolderIds: folderMode === 'ids' ? folderIds : undefined,
                 pruneMissingFolderTags: Boolean(options.pruneFolderTags),
@@ -1326,8 +1340,23 @@ export function buildCli() {
                   ? formatFolderRetryCommand(folderNames)
                   : folderMode === 'ids'
                     ? formatFolderIdRetryCommand(folderIds)
+                    : folderMode === 'recent'
+                      ? `ft sync --recent-folders ${recentFolderLimit ?? folderResult.targetFolderCount}`
                     : `ft sync --folders`;
                 console.log(`  Re-run \`${retryCmd}\` to retry.`);
+              }
+
+              if (folderResult.coverage && folderResult.coverage.targetRecordIds > 0) {
+                const remaining = folderResult.coverage.remainingRecordIds.length;
+                if (remaining === 0) {
+                  console.log(`\n  \u2713 Folder reconciliation tagged all ${folderResult.coverage.targetRecordIds} pending bookmark(s).`);
+                } else {
+                  console.log(
+                    `\n  \u26a0 ${remaining}/${folderResult.coverage.targetRecordIds} pending bookmark(s) still untagged after ` +
+                    `${folderResult.perFolder.filter((f) => f.stats).length}/${folderResult.targetFolderCount} folder(s).`
+                  );
+                  console.log(`  Increase --recent-folders or run specific --folder passes to continue reconciliation.`);
+                }
               }
 
               if (folderResult.orphanFoldersCleared.length > 0) {

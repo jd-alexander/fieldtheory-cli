@@ -23,6 +23,9 @@ import {
   fetchBookmarkFolders,
   formatSyncResult,
   hashFolderRecordIds,
+  getFolderTagCoverage,
+  getUntaggedRecordIds,
+  limitBookmarkFolderTargets,
   mergeFolderInventoryState,
   resolveBookmarkFolderTargets,
   syncBookmarksGraphQL,
@@ -2614,6 +2617,21 @@ test('main-sync merge preserves folder tags on existing records', () => {
   assert.deepEqual(merged[0].folderNames, ['Coding']);
 });
 
+test('main-sync merge reports newly added ids for folder reconciliation', () => {
+  const existing = [
+    makeRecord({ id: '1', tweetId: '1', folderIds: ['f-coding'], folderNames: ['Coding'] }),
+  ];
+  const incoming = [
+    makeRecord({ id: '1', tweetId: '1', text: 'Updated' }),
+    makeRecord({ id: '2', tweetId: '2' }),
+  ];
+
+  const { added, addedIds } = mergeRecords(existing, incoming);
+
+  assert.equal(added, 1);
+  assert.deepEqual(addedIds, ['2']);
+});
+
 test('mergeBookmarkRecord: empty incoming folder arrays do not erase captured folder tags', () => {
   const existing = makeRecord({
     id: '1',
@@ -2730,6 +2748,31 @@ test('resolveBookmarkFolderTargets: resolves selected folder ids in request orde
 
 test('resolveBookmarkFolderTargets: defaults to all folders when no filter is set', () => {
   assert.deepEqual(resolveBookmarkFolderTargets(FOLDERS).map((folder) => folder.id), ['f1', 'f2', 'f3', 'f4']);
+});
+
+test('limitBookmarkFolderTargets: keeps X live order while bounding recent folder walks', () => {
+  assert.deepEqual(limitBookmarkFolderTargets(FOLDERS, 2).map((folder) => folder.id), ['f1', 'f2']);
+  assert.deepEqual(limitBookmarkFolderTargets(FOLDERS).map((folder) => folder.id), ['f1', 'f2', 'f3', 'f4']);
+});
+
+test('getFolderTagCoverage: treats untagged target ids as pending reconciliation', () => {
+  const coverage = getFolderTagCoverage([
+    makeRecord({ id: '1', folderIds: ['f1'], folderNames: ['Coding'] }),
+    makeRecord({ id: '2' }),
+  ], ['1', '2', '3', '2']);
+
+  assert.equal(coverage.targetRecordIds, 3);
+  assert.equal(coverage.taggedRecordIds, 1);
+  assert.deepEqual(coverage.remainingRecordIds, ['2', '3']);
+  assert.equal(coverage.stoppedAfterCoverage, false);
+});
+
+test('getUntaggedRecordIds: finds records still waiting on folder reconciliation', () => {
+  assert.deepEqual(getUntaggedRecordIds([
+    makeRecord({ id: '1', folderIds: ['f1'], folderNames: ['Coding'] }),
+    makeRecord({ id: '2', folderIds: [], folderNames: [] }),
+    makeRecord({ id: '3' }),
+  ]), ['2', '3']);
 });
 
 // ── withoutFolder dedup (M1) ───────────────────────────────────────────

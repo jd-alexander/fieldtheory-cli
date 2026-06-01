@@ -149,6 +149,8 @@ export interface SyncProgress {
 
 export interface SyncResult {
   added: number;
+  /** Tweet/bookmark ids newly added during this raw timeline sync. */
+  addedIds?: string[];
   bookmarkedAtRepaired: number;
   totalBookmarks: number;
   bookmarkedAtMissing: number;
@@ -644,18 +646,22 @@ export function mergeBookmarkRecord(existing: BookmarkRecord | undefined, incomi
 export function mergeRecords(
   existing: BookmarkRecord[],
   incoming: BookmarkRecord[]
-): { merged: BookmarkRecord[]; added: number } {
+): { merged: BookmarkRecord[]; added: number; addedIds: string[] } {
   const byId = new Map(existing.map((r) => [r.id, r]));
   let added = 0;
+  const addedIds: string[] = [];
   for (const record of incoming) {
     const prev = byId.get(record.id);
-    if (!prev) added += 1;
+    if (!prev) {
+      added += 1;
+      addedIds.push(record.id);
+    }
     // Preserve folder arrays from prev since main sync never carries folder data.
     byId.set(record.id, mergeBookmarkRecord(prev, record));
   }
   const merged = Array.from(byId.values());
   merged.sort((a, b) => compareBookmarkChronology(b, a));
-  return { merged, added };
+  return { merged, added, addedIds };
 }
 
 function updateState(
@@ -739,6 +745,7 @@ export async function syncBookmarksGraphQL(
   const started = Date.now();
   let page = 0;
   let totalAdded = 0;
+  const addedIds: string[] = [];
   let stalePages = 0;
   let cursor: string | undefined = options.resumeCursor;
   const allSeenIds: string[] = [];
@@ -781,9 +788,10 @@ export async function syncBookmarksGraphQL(
       break;
     }
 
-    const { merged, added } = mergeRecords(existing, result.records);
+    const { merged, added, addedIds: pageAddedIds } = mergeRecords(existing, result.records);
     existing = merged;
     totalAdded += added;
+    addedIds.push(...pageAddedIds);
     result.records.forEach((r) => allSeenIds.push(r.id));
     const reachedLatestStored = Boolean(newestKnownId) && result.records.some((record) => record.id === newestKnownId);
 
@@ -880,10 +888,11 @@ export async function syncBookmarksGraphQL(
         break;
       }
 
-      const { merged, added } = mergeRecords(existing, result.records);
+      const { merged, added, addedIds: pageAddedIds } = mergeRecords(existing, result.records);
       existing = merged;
       totalAdded += added;
       continueAdded += added;
+      addedIds.push(...pageAddedIds);
       result.records.forEach((r) => allSeenIds.push(r.id));
       cursor = result.nextCursor;
 
@@ -948,6 +957,7 @@ export async function syncBookmarksGraphQL(
 
   return {
     added: totalAdded,
+    addedIds,
     bookmarkedAtRepaired,
     totalBookmarks: existing.length,
     bookmarkedAtMissing,
@@ -1434,6 +1444,12 @@ export interface FolderSyncOptions {
    * Default is archival mode, which never removes previously captured tags.
    */
   pruneMissingFolderTags?: boolean;
+  /** Limit target folders after live X order/name/id resolution. Useful for recent-folder reconciliation. */
+  folderLimit?: number;
+  /** Stop walking additional folders once these local record ids have at least one folder tag. */
+  stopWhenRecordIdsTagged?: string[];
+  /** Include all currently untagged records as folder reconciliation targets. */
+  reconcileUntaggedRecords?: boolean;
   delayMs?: number;
   onProgress?: (status: FolderSyncProgress) => void;
 }
@@ -1449,11 +1465,20 @@ export interface FolderSyncProgress {
 export interface FolderSyncResult {
   folders: BookmarkFolder[];
   perFolder: Array<{ folder: BookmarkFolder; stats: FolderMirrorStats | null; skipped?: string }>;
+  targetFolderCount: number;
   totalAdded: number;
   totalTagged: number;
   totalUntagged: number;
   skippedFolders: Array<{ folder: BookmarkFolder; reason: string }>;
   orphanFoldersCleared: Array<{ folderId: string; recordsAffected: number }>;
+  coverage?: FolderTagCoverage;
+}
+
+export interface FolderTagCoverage {
+  targetRecordIds: number;
+  taggedRecordIds: number;
+  remainingRecordIds: string[];
+  stoppedAfterCoverage: boolean;
 }
 
 function resolveBookmarkFolderByName(allFolders: BookmarkFolder[], query: string): BookmarkFolder {
@@ -1516,6 +1541,34 @@ export function resolveBookmarkFolderTargets(
   }
 
   return resolved;
+}
+
+export function limitBookmarkFolderTargets(folders: BookmarkFolder[], limit?: number): BookmarkFolder[] {
+  if (limit == null) return folders;
+  if (!Number.isFinite(limit) || limit < 1) return [];
+  return folders.slice(0, Math.floor(limit));
+}
+
+export function getFolderTagCoverage(records: BookmarkRecord[], recordIds: string[]): FolderTagCoverage {
+  const uniqueIds = [...new Set(recordIds.map((id) => id.trim()).filter(Boolean))];
+  const recordsById = new Map(records.map((record) => [record.id, record]));
+  const remainingRecordIds = uniqueIds.filter((id) => {
+    const record = recordsById.get(id);
+    return !record || (record.folderIds?.length ?? 0) === 0;
+  });
+
+  return {
+    targetRecordIds: uniqueIds.length,
+    taggedRecordIds: uniqueIds.length - remainingRecordIds.length,
+    remainingRecordIds,
+    stoppedAfterCoverage: false,
+  };
+}
+
+export function getUntaggedRecordIds(records: BookmarkRecord[]): string[] {
+  return records
+    .filter((record) => (record.folderIds?.length ?? 0) === 0)
+    .map((record) => record.id);
 }
 
 export interface BookmarkFolderStateEntry {
@@ -1701,7 +1754,18 @@ export async function syncBookmarkFolders(
   let folderState = mergeFolderInventoryState(await loadFolderSyncState(folderStatePath), allFolders, listedAt);
   await writeJson(folderStatePath, folderState);
 
-  const targetFolders = resolveBookmarkFolderTargets(allFolders, options);
+  const targetFolders = limitBookmarkFolderTargets(
+    resolveBookmarkFolderTargets(allFolders, options),
+    options.folderLimit,
+  );
+  const coverageTargetIds = [
+    ...(options.stopWhenRecordIdsTagged ?? []),
+    ...(options.reconcileUntaggedRecords ? getUntaggedRecordIds(existing) : []),
+  ];
+  let coverage = coverageTargetIds.length > 0
+    ? getFolderTagCoverage(existing, coverageTargetIds)
+    : undefined;
+  let stoppedAfterCoverage = false;
 
   const perFolder: Array<{ folder: BookmarkFolder; stats: FolderMirrorStats | null; skipped?: string }> = [];
   const skippedFolders: Array<{ folder: BookmarkFolder; reason: string }> = [];
@@ -1710,6 +1774,11 @@ export async function syncBookmarkFolders(
   let totalUntagged = 0;
 
   for (let i = 0; i < targetFolders.length; i++) {
+    if (coverage && coverage.remainingRecordIds.length === 0) {
+      stoppedAfterCoverage = true;
+      break;
+    }
+
     const folder = targetFolders[i];
     options.onProgress?.({ phase: 'walking', folder, folderIndex: i, totalFolders: targetFolders.length });
 
@@ -1761,6 +1830,14 @@ export async function syncBookmarkFolders(
     folderState = updateFolderSyncedState(folderState, folder, walkResult.records, mirror.stats, new Date().toISOString());
     await writeJson(folderStatePath, folderState);
 
+    if (coverage) {
+      coverage = getFolderTagCoverage(existing, coverageTargetIds);
+      if (coverage.remainingRecordIds.length === 0) {
+        stoppedAfterCoverage = i < targetFolders.length - 1;
+        break;
+      }
+    }
+
     if (i < targetFolders.length - 1) {
       await new Promise((r) => setTimeout(r, Math.max(delayMs, 1000)));
     }
@@ -1808,11 +1885,15 @@ export async function syncBookmarkFolders(
   return {
     folders: allFolders,
     perFolder,
+    targetFolderCount: targetFolders.length,
     totalAdded,
     totalTagged,
     totalUntagged,
     skippedFolders,
     orphanFoldersCleared,
+    coverage: coverage
+      ? { ...coverage, stoppedAfterCoverage }
+      : undefined,
   };
 }
 
