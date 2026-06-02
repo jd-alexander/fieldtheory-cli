@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { compareVersions, runWithSpinner, buildCli, parseCookieOption } from '../src/cli.js';
+import { compareVersions, runWithSpinner, buildCli, parseCookieOption, resolveSyncThreadMode } from '../src/cli.js';
 import { dataDir } from '../src/paths.js';
 import { skillWithFrontmatter } from '../src/skill.js';
 
@@ -405,8 +405,42 @@ test('ft sync: media is on by default and exposes --no-media', () => {
   const recentFoldersOption = syncCmd.options.find((o: any) => o.long === '--recent-folders');
   assert.ok(recentFoldersOption);
   assert.match(recentFoldersOption.description, /raw timeline sync/i);
+  assert.ok(syncCmd.options.some((o: any) => o.long === '--skip-threads'));
   assert.ok(syncCmd.options.some((o: any) => o.long === '--recent-threads'));
   assert.ok(syncCmd.options.some((o: any) => o.long === '--thread-limit'));
+});
+
+test('resolveSyncThreadMode: plain browser sync checks recent threads by default', () => {
+  assert.deepEqual(resolveSyncThreadMode({}), {
+    enabled: true,
+    auto: true,
+    recentLimit: 5,
+    limit: 5,
+  });
+});
+
+test('resolveSyncThreadMode: explicit --threads keeps full backlog behavior', () => {
+  assert.deepEqual(resolveSyncThreadMode({ threads: true }), {
+    enabled: true,
+    auto: false,
+    recentLimit: undefined,
+    limit: undefined,
+  });
+});
+
+test('resolveSyncThreadMode: --recent-threads customizes safe auto window', () => {
+  assert.deepEqual(resolveSyncThreadMode({ recentThreads: 10 }), {
+    enabled: true,
+    auto: true,
+    recentLimit: 10,
+    limit: 10,
+  });
+});
+
+test('resolveSyncThreadMode: API, gaps, and skip modes disable default thread detection', () => {
+  assert.equal(resolveSyncThreadMode({ api: true }).enabled, false);
+  assert.equal(resolveSyncThreadMode({ gaps: true }).enabled, false);
+  assert.equal(resolveSyncThreadMode({ skipThreads: true }).enabled, false);
 });
 
 test('ft fetch-media exposes media quality option', () => {

@@ -242,6 +242,41 @@ const DEFAULT_TIMELINE_DELAY_MS = 2000;
 const DEFAULT_FOLDER_DELAY_MS = 3000;
 const DEFAULT_EXPANSION_DELAY_MS = 5000;
 const DEFAULT_MEDIA_DELAY_MS = 2000;
+const DEFAULT_RECENT_THREAD_LIMIT = 5;
+
+export interface SyncThreadMode {
+  enabled: boolean;
+  auto: boolean;
+  recentLimit?: number;
+  limit?: number;
+}
+
+export function resolveSyncThreadMode(options: {
+  threads?: boolean;
+  skipThreads?: boolean;
+  gaps?: boolean;
+  api?: boolean;
+  recentThreads?: unknown;
+  threadLimit?: unknown;
+}): SyncThreadMode {
+  if (options.skipThreads || options.gaps || options.api) {
+    return { enabled: false, auto: false };
+  }
+
+  const recentLimit = optionalNumber(options.recentThreads);
+  const limit = optionalNumber(options.threadLimit);
+  if (options.threads) {
+    return { enabled: true, auto: false, recentLimit, limit };
+  }
+
+  const autoRecentLimit = recentLimit ?? DEFAULT_RECENT_THREAD_LIMIT;
+  return {
+    enabled: true,
+    auto: true,
+    recentLimit: autoRecentLimit,
+    limit: limit ?? autoRecentLimit,
+  };
+}
 
 function parseNonNegativeInteger(value: string): number {
   const parsed = Number(value);
@@ -954,9 +989,10 @@ export function buildCli() {
       collectOptionValue,
     )
     .option('--prune-folder-tags', 'Remove folder tags that are missing from a complete X folder walk', false)
-    .option('--threads', 'Capture parent context and same-author thread continuations', false)
-    .option('--recent-threads <n>', 'With --threads, only check the N newest bookmarks for thread context', parsePositiveInteger)
-    .option('--thread-limit <n>', 'With --threads, cap the number of thread expansions after filtering', parsePositiveInteger)
+    .option('--threads', 'Expand all eligible pending thread candidates (default sync checks recent bookmarks only)', false)
+    .option('--skip-threads', 'Skip automatic recent thread detection', false)
+    .option('--recent-threads <n>', 'Limit thread detection to the N newest bookmarks (default: 5 unless --threads is used)', parsePositiveInteger)
+    .option('--thread-limit <n>', 'Cap thread expansions after filtering (default: 5 unless --threads is used)', parsePositiveInteger)
     .addOption(engineOption()))
     .action(async (options) => {
       const firstRun = isFirstRun();
@@ -969,20 +1005,22 @@ export function buildCli() {
           await resolveEngine({ override: engineOverride });
         }
 
-        const syncThreadsEnabled = Boolean(options.threads);
+        const threadOptionsRequested = Boolean(options.threads) || options.recentThreads != null || options.threadLimit != null;
+        const threadMode = resolveSyncThreadMode(options);
+        const syncThreadsEnabled = threadMode.enabled;
         const mutuallyExclusive = [options.rebuild, options.continue, options.gaps].filter(Boolean).length;
         if (mutuallyExclusive > 1) {
           console.error('  Error: --rebuild, --continue, and --gaps cannot be used together.');
           process.exitCode = 1;
           return;
         }
-        if (syncThreadsEnabled && options.gaps) {
-          console.error('  Error: --threads cannot be combined with --gaps yet. Run them separately.');
+        if (threadOptionsRequested && options.gaps) {
+          console.error('  Error: thread sync options cannot be combined with --gaps yet. Run them separately.');
           process.exitCode = 1;
           return;
         }
-        if (!syncThreadsEnabled && (options.recentThreads != null || options.threadLimit != null)) {
-          console.error('  Error: --recent-threads and --thread-limit require --threads.');
+        if (threadOptionsRequested && options.skipThreads) {
+          console.error('  Error: --skip-threads cannot be combined with thread sync options.');
           process.exitCode = 1;
           return;
         }
@@ -1006,7 +1044,7 @@ export function buildCli() {
           process.exitCode = 1;
           return;
         }
-        if (syncThreadsEnabled && options.api) {
+        if (threadOptionsRequested && options.api) {
           console.error('  Error: Thread sync requires browser session (GraphQL). Remove --api.');
           process.exitCode = 1;
           return;
@@ -1036,7 +1074,7 @@ export function buildCli() {
         const timelineDelayMs = resolveDelayMs(options.delayMs, DEFAULT_TIMELINE_DELAY_MS);
         const folderDelayMs = resolveDelayMs(options.delayMs, DEFAULT_FOLDER_DELAY_MS);
         const expansionDelayMs = resolveDelayMs(options.delayMs, DEFAULT_EXPANSION_DELAY_MS);
-        const safetyDelayMs = syncThreadsEnabled || options.gaps
+        const safetyDelayMs = options.gaps || (syncThreadsEnabled && !threadMode.auto)
           ? expansionDelayMs
           : folderMode !== 'off'
             ? folderDelayMs
@@ -1057,7 +1095,10 @@ export function buildCli() {
         const runThreadSync = async (cookieArgs: { csrfToken?: string; cookieHeader?: string }): Promise<void> => {
           if (!syncThreadsEnabled) return;
           const startTime = Date.now();
-          process.stderr.write(`\n  Expanding reply threads...\n`);
+          const threadOpening = threadMode.auto
+            ? `\n  Checking recent reply threads (${threadMode.recentLimit} newest, ${threadMode.limit} max)...\n`
+            : `\n  Expanding reply threads...\n`;
+          process.stderr.write(threadOpening);
           let lastProgress: ThreadSyncProgress = { done: 0, total: 0, contextFilled: 0, belowFilled: 0, emptyChecked: 0, failed: 0 };
           const spinner = createSpinner(() => {
             const p = lastProgress;
@@ -1081,8 +1122,8 @@ export function buildCli() {
               firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
               csrfToken: cookieArgs.csrfToken,
               cookieHeader: cookieArgs.cookieHeader,
-              recentLimit: optionalNumber(options.recentThreads),
-              limit: optionalNumber(options.threadLimit),
+              recentLimit: threadMode.recentLimit,
+              limit: threadMode.limit,
               onProgress: (progress: ThreadSyncProgress) => {
                 lastProgress = progress;
                 spinner.update();
