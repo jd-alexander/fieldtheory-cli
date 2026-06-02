@@ -1754,14 +1754,24 @@ export async function syncBookmarkFolders(
   let folderState = mergeFolderInventoryState(await loadFolderSyncState(folderStatePath), allFolders, listedAt);
   await writeJson(folderStatePath, folderState);
 
-  const targetFolders = limitBookmarkFolderTargets(
-    resolveBookmarkFolderTargets(allFolders, options),
-    options.folderLimit,
-  );
   const coverageTargetIds = [
     ...(options.stopWhenRecordIdsTagged ?? []),
     ...(options.reconcileUntaggedRecords ? getUntaggedRecordIds(existing) : []),
   ];
+  const skipRecentFolderWalk =
+    options.reconcileUntaggedRecords &&
+    coverageTargetIds.length === 0 &&
+    options.folderLimit != null &&
+    !options.onlyFolderId &&
+    !options.onlyFolderIds?.length &&
+    !options.onlyFolderName &&
+    !options.onlyFolderNames?.length;
+  const targetFolders = skipRecentFolderWalk
+    ? []
+    : limitBookmarkFolderTargets(
+        resolveBookmarkFolderTargets(allFolders, options),
+        options.folderLimit,
+      );
   let coverage = coverageTargetIds.length > 0
     ? getFolderTagCoverage(existing, coverageTargetIds)
     : undefined;
@@ -2483,6 +2493,10 @@ function isPermanentThreadFailure(status: TweetFetchResult['status'] | null): bo
 export interface SyncThreadsOptions {
   onProgress?: (progress: ThreadSyncProgress) => void;
   delayMs?: number;
+  /** Only consider the newest N bookmarks for thread expansion. */
+  recentLimit?: number;
+  /** Hard cap after filtering candidates. */
+  limit?: number;
   browser?: string;
   chromeUserDataDir?: string;
   chromeProfileDirectory?: string;
@@ -2592,7 +2606,13 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
   const records = loaded.records;
   const nowMs = Date.now();
   const now = new Date(nowMs).toISOString();
-  const candidates = records.filter((record) => shouldSyncThread(record, nowMs));
+  const candidatePool = options.recentLimit != null
+    ? records.slice(0, Math.max(0, Math.floor(options.recentLimit)))
+    : records;
+  let candidates = candidatePool.filter((record) => shouldSyncThread(record, nowMs));
+  if (options.limit != null) {
+    candidates = candidates.slice(0, Math.max(0, Math.floor(options.limit)));
+  }
   const total = candidates.length;
 
   if (total === 0) {

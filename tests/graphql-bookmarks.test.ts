@@ -1343,6 +1343,60 @@ test('syncThreads: rechecks recent empty threads but skips old checked empties',
   }, [recentChecked, oldChecked]);
 });
 
+test('syncThreads: recentLimit restricts expansion to newest bookmarks', async () => {
+  const newest = makeRecord({
+    id: 'newest',
+    tweetId: 'newest',
+    url: 'https://x.com/testuser/status/newest',
+    text: 'Newest',
+    authorHandle: 'testuser',
+  });
+  const older = makeRecord({
+    id: 'older',
+    tweetId: 'older',
+    url: 'https://x.com/testuser/status/older',
+    text: 'Older',
+    authorHandle: 'testuser',
+  });
+
+  await withIsolatedGapFillDataDir(async () => {
+    const calledIds: string[] = [];
+    const result = await syncThreads({
+      recentLimit: 1,
+      threadFetcher: async (record) => {
+        calledIds.push(record.id);
+        return { context: [], below: [], status: 'ok' };
+      },
+      delayMs: 0,
+    });
+
+    assert.deepEqual(calledIds, ['newest']);
+    assert.equal(result.total, 1);
+  }, [newest, older]);
+});
+
+test('syncThreads: limit caps expansion after candidate filtering', async () => {
+  const records = [
+    makeRecord({ id: '1', tweetId: '1', url: 'https://x.com/u/status/1', text: 'One', authorHandle: 'u' }),
+    makeRecord({ id: '2', tweetId: '2', url: 'https://x.com/u/status/2', text: 'Two', authorHandle: 'u' }),
+  ];
+
+  await withIsolatedGapFillDataDir(async () => {
+    const calledIds: string[] = [];
+    const result = await syncThreads({
+      limit: 1,
+      threadFetcher: async (record) => {
+        calledIds.push(record.id);
+        return { context: [], below: [], status: 'ok' };
+      },
+      delayMs: 0,
+    });
+
+    assert.deepEqual(calledIds, ['1']);
+    assert.equal(result.total, 1);
+  }, records);
+});
+
 test('syncThreads: permanent focal failure stamps threadExpansionFailedAt', async () => {
   const bookmark = makeRecord({
     id: '400',

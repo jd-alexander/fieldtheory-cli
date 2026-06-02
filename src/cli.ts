@@ -955,6 +955,8 @@ export function buildCli() {
     )
     .option('--prune-folder-tags', 'Remove folder tags that are missing from a complete X folder walk', false)
     .option('--threads', 'Capture parent context and same-author thread continuations', false)
+    .option('--recent-threads <n>', 'With --threads, only check the N newest bookmarks for thread context', parsePositiveInteger)
+    .option('--thread-limit <n>', 'With --threads, cap the number of thread expansions after filtering', parsePositiveInteger)
     .addOption(engineOption()))
     .action(async (options) => {
       const firstRun = isFirstRun();
@@ -976,6 +978,11 @@ export function buildCli() {
         }
         if (syncThreadsEnabled && options.gaps) {
           console.error('  Error: --threads cannot be combined with --gaps yet. Run them separately.');
+          process.exitCode = 1;
+          return;
+        }
+        if (!syncThreadsEnabled && (options.recentThreads != null || options.threadLimit != null)) {
+          console.error('  Error: --recent-threads and --thread-limit require --threads.');
           process.exitCode = 1;
           return;
         }
@@ -1074,6 +1081,8 @@ export function buildCli() {
               firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
               csrfToken: cookieArgs.csrfToken,
               cookieHeader: cookieArgs.cookieHeader,
+              recentLimit: optionalNumber(options.recentThreads),
+              limit: optionalNumber(options.threadLimit),
               onProgress: (progress: ThreadSyncProgress) => {
                 lastProgress = progress;
                 spinner.update();
