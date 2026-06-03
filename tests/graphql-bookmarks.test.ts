@@ -1375,6 +1375,42 @@ test('syncThreads: recentLimit restricts expansion to newest bookmarks', async (
   }, [newest, older]);
 });
 
+test('syncThreads: recentLimit uses bookmark chronology, not JSONL order', async () => {
+  const olderFirst = makeRecord({
+    id: 'older-first',
+    tweetId: 'older-first',
+    url: 'https://x.com/testuser/status/older-first',
+    text: 'Older file entry',
+    authorHandle: 'testuser',
+    postedAt: '2026-06-01T00:00:00.000Z',
+    sortIndex: '20',
+  });
+  const newestSecond = makeRecord({
+    id: 'newest-second',
+    tweetId: 'newest-second',
+    url: 'https://x.com/testuser/status/newest-second',
+    text: 'Newest file entry',
+    authorHandle: 'testuser',
+    postedAt: '2026-06-03T00:00:00.000Z',
+    sortIndex: '10',
+  });
+
+  await withIsolatedGapFillDataDir(async () => {
+    const calledIds: string[] = [];
+    const result = await syncThreads({
+      recentLimit: 1,
+      threadFetcher: async (record) => {
+        calledIds.push(record.id);
+        return { context: [], below: [], status: 'ok' };
+      },
+      delayMs: 0,
+    });
+
+    assert.deepEqual(calledIds, ['newest-second']);
+    assert.equal(result.total, 1);
+  }, [olderFirst, newestSecond]);
+});
+
 test('syncThreads: limit caps expansion after candidate filtering', async () => {
   const records = [
     makeRecord({ id: '1', tweetId: '1', url: 'https://x.com/u/status/1', text: 'One', authorHandle: 'u' }),

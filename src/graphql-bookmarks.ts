@@ -205,9 +205,15 @@ function parseBookmarkTimestamp(record: BookmarkRecord): number | null {
   return null;
 }
 
+function parseTimelineSortIndex(value?: string | null): bigint | null {
+  const parsed = parseSnowflake(value);
+  if (parsed == null) return null;
+  return parsed >= 1_000_000_000_000_000n ? parsed : null;
+}
+
 function compareBookmarkChronology(a: BookmarkRecord, b: BookmarkRecord): number {
-  const aSortIndex = parseSnowflake(a.sortIndex);
-  const bSortIndex = parseSnowflake(b.sortIndex);
+  const aSortIndex = parseTimelineSortIndex(a.sortIndex);
+  const bSortIndex = parseTimelineSortIndex(b.sortIndex);
   if (aSortIndex != null && bSortIndex != null && aSortIndex !== bSortIndex) {
     return aSortIndex > bSortIndex ? 1 : -1;
   }
@@ -2518,6 +2524,13 @@ function shouldSyncThread(record: BookmarkRecord, nowMs: number): boolean {
   return nowMs - checkedAtMs >= MIN_THREAD_RECHECK_MS;
 }
 
+function recentThreadCandidatePool(records: BookmarkRecord[], recentLimit?: number): BookmarkRecord[] {
+  if (recentLimit == null) return records;
+  return [...records]
+    .sort((a, b) => compareBookmarkChronology(b, a))
+    .slice(0, Math.max(0, Math.floor(recentLimit)));
+}
+
 async function fetchThreadTweetById(
   tweetId: string,
   cookies: { csrfToken?: string; cookieHeader?: string },
@@ -2606,9 +2619,7 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
   const records = loaded.records;
   const nowMs = Date.now();
   const now = new Date(nowMs).toISOString();
-  const candidatePool = options.recentLimit != null
-    ? records.slice(0, Math.max(0, Math.floor(options.recentLimit)))
-    : records;
+  const candidatePool = recentThreadCandidatePool(records, options.recentLimit);
   let candidates = candidatePool.filter((record) => shouldSyncThread(record, nowMs));
   if (options.limit != null) {
     candidates = candidates.slice(0, Math.max(0, Math.floor(options.limit)));
