@@ -1150,6 +1150,87 @@ test('syncGaps: articlesOnly skips non-article quoted and truncated gaps but fil
   }, [quotedMissing, quotedArticle, truncated, xArticle]);
 });
 
+test('syncGaps: onlyTweetIds limits article enrichment to targeted bookmarks', async () => {
+  const oldXArticle: BookmarkRecord = {
+    id: 'old-x-article',
+    tweetId: 'old-x-article',
+    url: 'https://x.com/alice/status/old-x-article',
+    text: 'https://x.com/i/article/old-article-id',
+    links: ['https://x.com/i/article/old-article-id'],
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+  const newXArticle: BookmarkRecord = {
+    id: 'new-x-article',
+    tweetId: 'new-x-article',
+    url: 'https://x.com/alice/status/new-x-article',
+    text: 'https://x.com/i/article/new-article-id',
+    links: ['https://x.com/i/article/new-article-id'],
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+  const oldExternalArticle: BookmarkRecord = {
+    id: 'old-external',
+    tweetId: 'old-external',
+    url: 'https://x.com/alice/status/old-external',
+    text: 'https://example.com/old',
+    links: ['https://example.com/old'],
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+  const newExternalArticle: BookmarkRecord = {
+    id: 'new-external',
+    tweetId: 'new-external',
+    url: 'https://x.com/alice/status/new-external',
+    text: 'https://example.com/new',
+    links: ['https://example.com/new'],
+    syncedAt: NOW,
+    tags: [],
+    ingestedVia: 'graphql',
+  };
+
+  await withIsolatedGapFillDataDir(async () => {
+    await buildIndex();
+    const tweetCalls: string[] = [];
+    const articleCalls: string[] = [];
+
+    const result = await syncGaps({
+      articlesOnly: true,
+      onlyTweetIds: ['new-x-article', 'new-external'],
+      tweetFetcher: async (tweetId) => {
+        tweetCalls.push(tweetId);
+        return {
+          snapshot: { id: tweetId, text: 'preview', url: `https://x.com/alice/status/${tweetId}` },
+          article: { title: 'New X Article', text: 'New X Article body from the authenticated payload.' },
+          status: 'ok',
+          source: 'graphql',
+        };
+      },
+      articleFetcher: async (url) => {
+        articleCalls.push(url);
+        return {
+          title: 'New External Article',
+          text: 'New external article body from the linked page with enough detail to pass the article extraction threshold.',
+          siteName: 'Example',
+        };
+      },
+    });
+
+    assert.equal(result.total, 2);
+    assert.equal(result.articlesEnriched, 2);
+    assert.deepEqual(tweetCalls, ['new-x-article']);
+    assert.deepEqual(articleCalls, ['https://example.com/new']);
+
+    assert.equal((await getBookmarkById('old-x-article'))?.articleText, null);
+    assert.equal((await getBookmarkById('old-external'))?.articleText, null);
+    assert.equal((await getBookmarkById('new-x-article'))?.articleTitle, 'New X Article');
+    assert.equal((await getBookmarkById('new-external'))?.articleTitle, 'New External Article');
+  }, [oldXArticle, newXArticle, oldExternalArticle, newExternalArticle]);
+});
+
 async function withIsolatedGapFillDataDir(
   fn: () => Promise<void>,
   fixtures: BookmarkRecord[],

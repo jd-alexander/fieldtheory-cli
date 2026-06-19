@@ -2818,6 +2818,12 @@ export interface SyncGapsOptions {
   articleLimit?: number;
   /** Only run article enrichment gaps; skip quoted tweet and long-text expansion work. */
   articlesOnly?: boolean;
+  /**
+   * Restrict gap detection to these bookmark/tweet ids. Useful for the default
+   * post-sync article pass, where new X Article bookmarks should be enriched
+   * immediately without walking the entire historical archive.
+   */
+  onlyTweetIds?: string[];
 }
 
 function resolveGapFillCookies(options: SyncGapsOptions): { csrfToken?: string; cookieHeader?: string } {
@@ -2895,6 +2901,15 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   const cachePath = twitterBookmarksCachePath();
   const loaded = sanitizeRecords(await readJsonLines<BookmarkRecord>(cachePath));
   const records = loaded.records;
+  const scopedIds = new Set((options.onlyTweetIds ?? []).map((id) => id.trim()).filter(Boolean));
+  const inScope = (record: BookmarkRecord): boolean => {
+    if (scopedIds.size === 0) return true;
+    return scopedIds.has(record.id)
+      || scopedIds.has(record.tweetId)
+      || Boolean(record.quotedStatusId && scopedIds.has(record.quotedStatusId))
+      || Boolean(record.quotedTweet?.id && scopedIds.has(record.quotedTweet.id));
+  };
+  const scopedRecords = records.filter(inScope);
 
   const cookies = options.tweetFetcher ? {} : resolveGapFillCookies(options);
   const fetcher: TweetFetcher = options.tweetFetcher
@@ -2917,7 +2932,7 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   // already tried and failed — otherwise dead tweets get re-fetched forever.
   const needsQuotedTweet = options.articlesOnly
     ? []
-    : records.filter((r) => r.quotedStatusId && !r.quotedTweet && !r.quotedTweetFailedAt);
+    : scopedRecords.filter((r) => r.quotedStatusId && !r.quotedTweet && !r.quotedTweetFailedAt);
   const quotedIds = new Set(needsQuotedTweet.map((r) => r.quotedStatusId!));
 
   // Gap 2: potentially truncated text. Skip records we've already attempted
@@ -2925,12 +2940,12 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   // that's already full-length won't be re-fetched on every run.
   const maybeTruncated = options.articlesOnly
     ? []
-    : records.filter((r) => (r.text?.length ?? 0) >= TRUNCATION_THRESHOLD && !r.textExpandedAt);
+    : scopedRecords.filter((r) => (r.text?.length ?? 0) >= TRUNCATION_THRESHOLD && !r.textExpandedAt);
   const truncatedIds = new Set(maybeTruncated.map((r) => r.tweetId));
 
   // Gap 3a: X Article bookmarks can look short ("x.com/i/article/…") even
   // when the useful body exists in the authenticated TweetResult payload.
-  const needsXArticle = records.filter((r) =>
+  const needsXArticle = scopedRecords.filter((r) =>
     !hasFullArticle(r) && recordHasXArticleUrl(r)
   );
   const xArticleIds = new Set(needsXArticle.map((r) => r.tweetId));
@@ -2938,7 +2953,7 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   // Gap 3a also applies to quoted tweets. A bookmarked tweet can quote an X
   // Article, leaving the readable archive with a useless quoted link stub even
   // though the quoted TweetResult payload contains the full article body.
-  const needsQuotedXArticle = records.filter((r) =>
+  const needsQuotedXArticle = scopedRecords.filter((r) =>
     r.quotedTweet &&
     !hasFullTweetSnapshotArticle(r.quotedTweet) &&
     tweetSnapshotHasXArticleUrl(r.quotedTweet)
@@ -3119,7 +3134,7 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   }
 
   // Find bookmarks missing bookmarkedAt (filled on next sync, not via syndication)
-  const bookmarkedAtMissing = records.filter((r) => !r.bookmarkedAt).length;
+  const bookmarkedAtMissing = scopedRecords.filter((r) => !r.bookmarkedAt).length;
 
   // Final persist (gaps 1+2)
   await persistGapProgress();
@@ -3131,7 +3146,7 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   // source for the readable folder archive.
 
   // Filter to link-only bookmarks not yet enriched
-  const needsEnrichment = records.filter((r) => {
+  const needsEnrichment = scopedRecords.filter((r) => {
     if (hasFullArticle(r)) return false;
     if (recordHasXArticleUrl(r)) return false;
     return isLinkOnlyBookmark(r);

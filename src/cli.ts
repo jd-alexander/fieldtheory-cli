@@ -4,7 +4,7 @@ import { syncTwitterBookmarks } from './bookmarks.js';
 import { getBookmarkStatusView, formatBookmarkStatus } from './bookmarks-service.js';
 import { runTwitterOAuthFlow } from './xauth.js';
 import { syncBookmarksGraphQL, syncGaps, syncBookmarkFolders, syncThreads } from './graphql-bookmarks.js';
-import type { SyncProgress, GapFillProgress, FolderSyncProgress, ThreadSyncProgress } from './graphql-bookmarks.js';
+import type { SyncProgress, GapFillProgress, GapFillFailure, GapFillResult, FolderSyncProgress, ThreadSyncProgress } from './graphql-bookmarks.js';
 import type { BookmarkFolder, QuotedTweetSnapshot, ThreadTweetSnapshot } from './types.js';
 import { DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MEDIA_QUALITY, fetchBookmarkMediaBatch, parseMediaQuality } from './bookmark-media.js';
 import type { MediaQuality } from './bookmark-media.js';
@@ -960,8 +960,10 @@ export function buildCli() {
     .option('--media-limit <n>', 'Cap on pending bookmarks whose media gets fetched after sync (default: all)', (v: string) => Number(v))
     .option('--media-max-bytes <n>', 'Per-asset byte limit for media downloads (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
     .option('--media-quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
-    .option('--article-limit <n>', 'Cap article page fetches during --gaps (default: all)', parseNonNegativeInteger)
+    .option('--article-limit <n>', 'Cap ordinary article page fetches during enrichment (default: all for --gaps; new bookmark count during sync)', parseNonNegativeInteger)
+    .option('--no-articles', 'Skip automatic article enrichment after syncing')
     .option('--articles-only', 'With --gaps, fetch article bodies only; skip quoted tweets and long-text expansion', false)
+    .option('--only-tweet-id <id>', 'With --gaps, restrict gap filling to one bookmark/tweet id; repeatable', collectOptionValue)
     .option('--skip-profile-images', 'Skip downloading author profile images', false)
     .option('--max-pages <n>', 'Max pages to fetch (default: unlimited)', (v: string) => Number(v))
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
@@ -1021,6 +1023,12 @@ export function buildCli() {
         }
         if (threadOptionsRequested && options.skipThreads) {
           console.error('  Error: --skip-threads cannot be combined with thread sync options.');
+          process.exitCode = 1;
+          return;
+        }
+        const gapOnlyTweetIds = normalizeOptionStrings(options.onlyTweetId);
+        if (gapOnlyTweetIds.length > 0 && !options.gaps) {
+          console.error('  Error: --only-tweet-id requires --gaps.');
           process.exitCode = 1;
           return;
         }
@@ -1145,6 +1153,78 @@ export function buildCli() {
           console.log('');
         };
 
+        const writeGapFailureLog = (failures: GapFillFailure[]): { path: string; byReason: Record<string, number> } => {
+          const logPath = path.join(dataDir(), 'gaps-failures.json');
+          const byReason: Record<string, number> = {};
+          for (const f of failures) {
+            byReason[f.reason] = (byReason[f.reason] ?? 0) + 1;
+          }
+          fs.writeFileSync(logPath, JSON.stringify({ failures, summary: byReason }, null, 2), { mode: 0o600 });
+          return { path: logPath, byReason };
+        };
+
+        const runNewBookmarkArticleSync = async (
+          cookieArgs: { csrfToken?: string; cookieHeader?: string },
+          addedIds: string[],
+        ): Promise<void> => {
+          if (options.articles === false) return;
+          const onlyTweetIds = [...new Set(addedIds.filter(Boolean))];
+          if (onlyTweetIds.length === 0) return;
+
+          const startTime = Date.now();
+          process.stderr.write(`\n  Enriching article bookmarks (${onlyTweetIds.length} new max)...\n`);
+          let lastProgress: GapFillProgress = { done: 0, total: 0, quotedFetched: 0, textExpanded: 0, articlesEnriched: 0, failed: 0 };
+          const spinner = createSpinner(() => {
+            const p = lastProgress;
+            const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            const parts = [`${p.done}/${p.total} (${pct}%)`];
+            if (p.articlesEnriched) parts.push(`${p.articlesEnriched} articles`);
+            if (p.failed) parts.push(`${p.failed} failed`);
+            parts.push(`${elapsed}s`);
+            return parts.join(' │ ');
+          });
+
+          let result: GapFillResult;
+          try {
+            result = await runWithSpinner(spinner, () => syncGaps({
+              delayMs: expansionDelayMs,
+              browser: options.browser ? String(options.browser) : undefined,
+              chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+              chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+              firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
+              csrfToken: cookieArgs.csrfToken,
+              cookieHeader: cookieArgs.cookieHeader,
+              articleLimit: typeof options.articleLimit === 'number' && !Number.isNaN(options.articleLimit)
+                ? options.articleLimit
+                : onlyTweetIds.length,
+              articlesOnly: true,
+              onlyTweetIds,
+              onProgress: (progress: GapFillProgress) => {
+                lastProgress = progress;
+                spinner.update();
+              },
+            }));
+          } catch (err) {
+            console.error(`\n  Article enrichment paused: ${(err as Error).message}`);
+            console.error('  Partial progress was saved. Re-run `ft sync --gaps --articles-only` later to resume.\n');
+            return;
+          }
+
+          if (result.total === 0) {
+            console.log('  No new article gaps found.');
+          } else {
+            if (result.articlesEnriched > 0) {
+              console.log(`  ✓ ${result.articlesEnriched} article bookmark${result.articlesEnriched === 1 ? '' : 's'} enriched`);
+            }
+            if (result.failed > 0) {
+              const log = writeGapFailureLog(result.failures);
+              console.log(`  ${result.failed} article enrichment miss${result.failed === 1 ? '' : 'es'}; details: ${log.path}`);
+            }
+          }
+          console.log('');
+        };
+
         // ── gaps mode: backfill missing data for existing bookmarks ──
         if (options.gaps) {
           const startTime = Date.now();
@@ -1180,6 +1260,7 @@ export function buildCli() {
               ? options.articleLimit
               : undefined,
             articlesOnly: Boolean(options.articlesOnly),
+            onlyTweetIds: gapOnlyTweetIds.length > 0 ? gapOnlyTweetIds : undefined,
             onProgress: (progress: GapFillProgress) => {
               lastProgress = progress;
               spinner.update();
@@ -1196,19 +1277,13 @@ export function buildCli() {
               await rebuildIndex();
             }
             if (result.failed > 0) {
-              // Write failure log
-              const logPath = path.join(dataDir(), 'gaps-failures.json');
-              const byReason: Record<string, number> = {};
-              for (const f of result.failures) {
-                byReason[f.reason] = (byReason[f.reason] ?? 0) + 1;
-              }
-              fs.writeFileSync(logPath, JSON.stringify({ failures: result.failures, summary: byReason }, null, 2), { mode: 0o600 });
+              const log = writeGapFailureLog(result.failures);
 
               console.log(`  ${result.failed} unavailable:`);
-              for (const [reason, count] of Object.entries(byReason)) {
+              for (const [reason, count] of Object.entries(log.byReason)) {
                 console.log(`    \u2022 ${count} ${reason}`);
               }
-              console.log(`  Details: ${logPath}`);
+              console.log(`  Details: ${log.path}`);
             }
             if (result.bookmarkedAtMissing > 0) {
               console.log(`  ${result.bookmarkedAtMissing} bookmarks missing a reliable bookmark date`);
@@ -1422,6 +1497,8 @@ export function buildCli() {
           }
 
           await runThreadSync({ csrfToken, cookieHeader });
+
+          await runNewBookmarkArticleSync({ csrfToken, cookieHeader }, result.addedIds ?? []);
 
           await postSyncMediaFetch();
 
