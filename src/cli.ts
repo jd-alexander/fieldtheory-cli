@@ -10,6 +10,7 @@ import { DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MEDIA_QUALITY, fetchBookmarkMediaBatch
 import type { MediaQuality } from './bookmark-media.js';
 import type { MediaFetchManifest, MediaFetchProgress } from './bookmark-media.js';
 import { exportReadableBookmarkArchive } from './bookmark-folder-export.js';
+import { exportTweetConversationMarkdown } from './tweet-conversation-export.js';
 import {
   buildIndex,
   searchBookmarks,
@@ -292,6 +293,14 @@ function optionalNumber(value: unknown): number | undefined {
 
 function resolveDelayMs(value: unknown, fallback: number): number {
   return optionalNumber(value) ?? fallback;
+}
+
+function parseTweetId(value: string): string {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return trimmed;
+  const match = trimmed.match(/(?:x|twitter)\.com\/[^/]+\/status\/(\d+)/i);
+  if (match?.[1]) return match[1];
+  throw new InvalidArgumentError('value must be a tweet id or an x.com/twitter.com status URL');
 }
 
 function collectOptionValue(value: string, previous: string[] = []): string[] {
@@ -1673,6 +1682,57 @@ export function buildCli() {
       if (item.links.length) console.log(`links: ${item.links.join(', ')}`);
       if (item.categories) console.log(`categories: ${item.categories}`);
       if (item.domains) console.log(`domains: ${item.domains}`);
+    }));
+
+  // ── conversation-md ─────────────────────────────────────────────────────
+
+  addHttpSafetyOptions(
+    program
+      .command('conversation-md')
+      .description('Export one X tweet conversation/reply tree as markdown')
+      .argument('<tweet>', 'Tweet id or x.com/twitter.com status URL', parseTweetId)
+      .option('--out <path>', 'Markdown output path (default: conversations/<date>-<author>-<slug>-<id>.md)')
+      .option('--max-pages <n>', 'Max TweetDetail pages to fetch (default: 12)', parsePositiveInteger)
+      .option('--expand-branches', 'Fetch incomplete reply branches after the root conversation cursor is exhausted', false)
+      .option('--branch-limit <n>', 'Max incomplete branches to fetch when --expand-branches is set (default: 40)', parsePositiveInteger)
+      .option('--branch-max-pages <n>', 'Max TweetDetail pages per branch expansion (default: 2)', parsePositiveInteger)
+      .option('--delay-ms <n>', 'Delay between TweetDetail pages in ms (default: 5000)', parseNonNegativeInteger)
+      .option('--browser <id>', 'Browser to read X cookies from (see `ft browsers`)')
+      .option('--chrome-user-data-dir <path>', 'Chrome-family user data directory override')
+      .option('--chrome-profile-directory <name>', 'Chrome-family profile directory override')
+      .option('--firefox-profile-dir <path>', 'Firefox profile directory override')
+      .option('--cookies <ct0> [auth_token...]', 'Use ct0 and optional auth_token directly instead of reading browser cookies', collectOptionValue)
+  )
+    .action(safe(async (tweetId: string, options) => {
+      const delayMs = resolveDelayMs(options.delayMs, 5000);
+      configureHttpSafetyFromOptions(options, delayMs);
+      const cookieOptions = parseCookieOption(options.cookies);
+      console.log(`  Exporting conversation for ${tweetId}...`);
+      const result = await exportTweetConversationMarkdown({
+        tweetId,
+        outPath: options.out ? String(options.out) : undefined,
+        maxPages: optionalNumber(options.maxPages) ?? 12,
+        delayMs,
+        expandBranches: Boolean(options.expandBranches),
+        branchLimit: optionalNumber(options.branchLimit),
+        branchMaxPages: optionalNumber(options.branchMaxPages),
+        browser: options.browser ? String(options.browser) : undefined,
+        chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+        chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+        firefoxProfileDir: options.firefoxProfileDir ? String(options.firefoxProfileDir) : undefined,
+        ...cookieOptions,
+      });
+      console.log(`  ✓ ${result.tweetCount} tweets captured`);
+      console.log(`  ✓ ${result.participantCount} participants captured`);
+      if (result.rootAuthorHandle) {
+        console.log(`  ✓ ${result.authorReplyCount} replies from @${result.rootAuthorHandle}`);
+      }
+      console.log(`  ✓ ${result.topLevelReplyCount} top-level replies`);
+      if (result.branchFetches > 0 || options.expandBranches) {
+        console.log(`  ✓ ${result.branchFetches} branch expansions checked`);
+        console.log(`  ✓ ${result.branchTweetsAdded} tweets added from branch expansions`);
+      }
+      console.log(`  ✓ Markdown: ${result.path}`);
     }));
 
   // ── stats ───────────────────────────────────────────────────────────────

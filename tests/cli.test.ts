@@ -460,6 +460,18 @@ test('ft archive-md command is registered', () => {
   assert.ok(archiveCmd.options.some((o: any) => o.long === '--no-unfiled'));
 });
 
+test('ft conversation-md command exposes branch expansion and HTTP safety options', () => {
+  const program = buildCli();
+  const conversationCmd = program.commands.find((c: any) => c.name() === 'conversation-md');
+  assert.ok(conversationCmd, 'conversation-md command should be registered');
+  const opts = conversationCmd.options.map((o: any) => o.long);
+  assert.ok(opts.includes('--expand-branches'));
+  assert.ok(opts.includes('--branch-limit'));
+  assert.ok(opts.includes('--branch-max-pages'));
+  assert.ok(opts.includes('--audit-http'));
+  assert.ok(opts.includes('--request-budget'));
+});
+
 test('ft wiki: description mentions engine prerequisite', () => {
   const program = buildCli();
   const wikiCmd = program.commands.find((c: any) => c.name() === 'wiki');

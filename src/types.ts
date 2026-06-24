@@ -101,6 +101,7 @@ export interface ThreadTweetSnapshot extends TweetArticleSnapshot {
   media?: string[];
   mediaObjects?: BookmarkMediaObject[];
   links?: string[];
+  engagement?: BookmarkEngagementSnapshot;
   conversationId?: string;
   inReplyToStatusId?: string;
   /**
