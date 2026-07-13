@@ -350,6 +350,7 @@ export async function fetchBookmarkMediaBatch(
     retryFailed?: boolean;
     mediaQuality?: MediaQuality;
     folderNames?: string[];
+    onlyTweetIds?: string[];
     signal?: AbortSignal;
     onProgress?: (progress: MediaFetchProgress) => void;
   } = {}
@@ -362,6 +363,7 @@ export async function fetchBookmarkMediaBatch(
   const retryFailed = options.retryFailed ?? false;
   const mediaQuality = options.mediaQuality ?? DEFAULT_MEDIA_QUALITY;
   const folderNames = (options.folderNames ?? []).map((name) => name.trim().toLowerCase()).filter(Boolean);
+  const onlyTweetIds = new Set((options.onlyTweetIds ?? []).map((id) => id.trim()).filter(Boolean));
   const nowMs = Date.now();
   const mediaDir = bookmarkMediaDir();
   const manifestPath = bookmarkMediaManifestPath();
@@ -372,6 +374,11 @@ export async function fetchBookmarkMediaBatch(
   const coveredProfileImageUrls = buildCoveredProfileImageUrls(previous, maxBytes, retryFailed, nowMs);
   const bookmarks = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
   const candidates = bookmarks
+    .filter((bookmark) =>
+      onlyTweetIds.size === 0 ||
+      onlyTweetIds.has(bookmark.id) ||
+      onlyTweetIds.has(bookmark.tweetId)
+    )
     .filter((bookmark) =>
       folderNames.length === 0 ||
       (bookmark.folderNames ?? []).some((name) => folderNames.includes(name.trim().toLowerCase()))

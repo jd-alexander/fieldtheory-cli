@@ -377,7 +377,7 @@ function printMediaFetchSummary(result: MediaFetchManifest): void {
   console.log(`  ✓ Manifest: ${bookmarkMediaManifestPath()}`);
 }
 
-async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; mediaQuality?: MediaQuality; skipProfileImages?: boolean; retryFailed?: boolean; folderNames?: string[] } = {}): Promise<MediaFetchManifest> {
+async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; mediaQuality?: MediaQuality; skipProfileImages?: boolean; retryFailed?: boolean; folderNames?: string[]; onlyTweetIds?: string[] } = {}): Promise<MediaFetchManifest> {
   const startTime = Date.now();
   const controller = new AbortController();
   let lastMedia: MediaFetchProgress = {
@@ -403,6 +403,7 @@ async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: n
     skipProfileImages: options.skipProfileImages,
     retryFailed: options.retryFailed,
     folderNames: options.folderNames,
+    onlyTweetIds: options.onlyTweetIds,
     signal: controller.signal,
     onProgress: (progress: MediaFetchProgress) => {
       lastMedia = progress;
@@ -2398,6 +2399,7 @@ export function buildCli() {
     .option('--max-bytes <n>', 'Per-asset byte limit (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
     .option('--quality <quality>', 'Photo quality for pbs.twimg.com/media downloads: medium, large, 4096x4096, orig', DEFAULT_MEDIA_QUALITY)
     .option('--folder <name>', 'Only fetch media for this X bookmark folder; repeat for a selected batch', collectOptionValue)
+    .option('--only-tweet-id <id>', 'Only fetch media for this bookmark/tweet id; repeat for a selected batch', collectOptionValue)
     .option('--skip-profile-images', 'Skip downloading author profile images')
     .option('--retry-failed', 'Retry failed media entries without waiting for backoff')
     .option('--delay-ms <n>', 'Minimum delay between media HTTP requests in ms (default: 2000)', parseNonNegativeInteger))
@@ -2413,6 +2415,7 @@ export function buildCli() {
         skipProfileImages: Boolean(options.skipProfileImages),
         retryFailed: Boolean(options.retryFailed),
         folderNames: normalizeOptionStrings(options.folder),
+        onlyTweetIds: normalizeOptionStrings(options.onlyTweetId),
       });
     }));
 

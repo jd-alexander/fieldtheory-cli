@@ -183,6 +183,61 @@ test('fetchBookmarkMediaBatch filters candidates by folder name', async () => {
   }
 });
 
+test('fetchBookmarkMediaBatch filters candidates by tweet id', async () => {
+  const selectedPhotoUrl = 'https://pbs.twimg.com/media/selected.jpg';
+  const otherPhotoUrl = 'https://pbs.twimg.com/media/other.jpg';
+  const records = [
+    {
+      id: 'selected-bookmark',
+      tweetId: 'selected-tweet',
+      url: 'https://x.com/alice/status/selected-tweet',
+      text: 'selected media',
+      syncedAt: '2026-04-09T00:00:00.000Z',
+      mediaObjects: [{ type: 'photo', url: selectedPhotoUrl }],
+      tags: [],
+      ingestedVia: 'graphql',
+    },
+    {
+      id: 'other-bookmark',
+      tweetId: 'other-tweet',
+      url: 'https://x.com/alice/status/other-tweet',
+      text: 'other media',
+      syncedAt: '2026-04-09T00:00:00.000Z',
+      mediaObjects: [{ type: 'photo', url: otherPhotoUrl }],
+      tags: [],
+      ingestedVia: 'graphql',
+    },
+  ];
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      const manifest = await fetchBookmarkMediaBatch({ maxBytes: 1024, onlyTweetIds: ['selected-tweet'] });
+      const downloaded = manifest.entries
+        .filter((entry) => entry.status === 'downloaded')
+        .map((entry) => entry.sourceUrl);
+
+      assert.deepEqual(downloaded, [selectedPhotoUrl]);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('fetchBookmarkMediaBatch downloads X Article cover and inline images', async () => {
   const coverUrl = 'https://pbs.twimg.com/media/article-cover.jpg';
   const inlineUrl = 'https://pbs.twimg.com/media/article-inline.jpg';

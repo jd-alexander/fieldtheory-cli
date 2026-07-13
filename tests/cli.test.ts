@@ -448,6 +448,7 @@ test('ft fetch-media exposes media quality option', () => {
   const fetchMediaCmd = program.commands.find((c: any) => c.name() === 'fetch-media');
   assert.ok(fetchMediaCmd, 'fetch-media command should be registered');
   assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--quality'));
+  assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--only-tweet-id'));
   assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--audit-http'));
   assert.ok(fetchMediaCmd.options.some((o: any) => o.long === '--request-budget'));
 });
