@@ -22,7 +22,7 @@ interface AuditEntry {
   errorName?: string;
   responseHeaders?: Record<string, string>;
 }
-interface SyncState { pending?: Pending; }
+interface SyncState { pending?: Pending; timelineCursor?: string; }
 
 interface ArchiveSyncServices {
   timeline: typeof syncBookmarksGraphQL;
@@ -178,6 +178,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const beforeIds = new Set(initial.map((record) => record.id));
     const statePath = path.join(logs, 'archive-sync-state.json');
     const saved = jsonFile<SyncState>(statePath, {});
+    let timelineCursor = saved.timelineCursor;
     const pending: Pending = { threads: [], gaps: [], media: [], folders: [], ...saved.pending };
     const startedAt = new Date().toISOString();
     const runId = startedAt.replace(/[:.]/g, '-');
@@ -188,6 +189,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       requestBudget: Math.max(1, allowance), maxRequestsPerHour: options.hourlyBudget, rateLimitFloor: 120 });
     const auth = { browser: options.browser, chromeProfileDirectory: options.chromeProfileDirectory, firefoxProfileDir: options.firefoxProfileDir };
     const stages: Record<string, unknown> = {};
+    const persistState = (): void => saveJson(statePath, { startedAt, pending, timelineCursor });
     let paused: string | undefined = allowance === 0 ? 'hourly request budget reached' : undefined;
     const freshAudit = (): AuditEntry[] => auditEntries(logs).filter((entry) => entry.ts >= startedAt);
     const run = async <T>(name: string, task: () => Promise<T>): Promise<T | undefined> => {
@@ -211,16 +213,22 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         return undefined;
       }
     };
-    const timeline = await run('timeline', () => services.timeline({ ...auth, incremental: true, maxPages: 12,
+    const timeline = await run('timeline', () => services.timeline({ ...auth, incremental: true, resumeCursor: timelineCursor, maxPages: 12,
       delayMs: 3000, maxMinutes: 15, onProgress: (p) => console.log(`[timeline] page ${p.page}: ${p.newAdded} new`) }));
-    if (timeline && !['caught up to newest stored bookmark', 'end of bookmarks', 'no new bookmarks (stale)'].includes(timeline.stopReason)) paused = timeline.stopReason;
+    if (timeline) {
+      if (['caught up to newest stored bookmark', 'end of bookmarks', 'no new bookmarks (stale)'].includes(timeline.stopReason)) timelineCursor = undefined;
+      else {
+        paused = timeline.stopReason;
+        timelineCursor = jsonFile<{ lastCursor?: string }>(path.join(directory, 'bookmarks-backfill-state.json'), {}).lastCursor ?? timelineCursor;
+      }
+    }
     const captured = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
     const newIds = captured.filter((record) => !beforeIds.has(record.id)).map((record) => record.id);
     for (const stage of Object.keys(pending) as Stage[]) pending[stage] = [...new Set([...pending[stage], ...newIds])];
-    saveJson(statePath, { startedAt, pending });
+    persistState();
     const completeStage = (stage: Stage): void => {
       pending[stage] = [];
-      saveJson(statePath, { startedAt, pending });
+      persistState();
     };
     const enrich = async (): Promise<void> => {
       if (pending.threads.length) {
@@ -247,14 +255,14 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       onProgress: (p) => { if (p.folder && p.phase === 'walking') console.log(`[folders] ${p.folder.name}`); } }));
     if (folders) {
       pending.folders = folders.coverage?.remainingRecordIds ?? [];
-      saveJson(statePath, { startedAt, pending });
+      persistState();
     }
     // Folder walks can discover bookmarks absent from the all-bookmarks timeline.
     const records = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
     const folderOnlyIds = records.filter((record) => !beforeIds.has(record.id) && !newIds.includes(record.id)).map((record) => record.id);
     for (const stage of ['threads', 'gaps', 'media'] as Stage[]) pending[stage] = [...new Set([...pending[stage], ...folderOnlyIds])];
     if (folderOnlyIds.length) {
-      saveJson(statePath, { startedAt, pending });
+      persistState();
       await enrich();
     }
     const finalRecords = folderOnlyIds.length ? await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath()) : records;
@@ -274,7 +282,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const summary = {
       startedAt, generatedAt: new Date().toISOString(), beforeCount: initial.length, afterCount: records.length,
       newCount: records.length - initial.length, batchCount: batch.length, paused: paused ?? null,
-      pending, stages, exported, previewPath,
+      pending, timelineCursor, stages, exported, previewPath,
       media: { downloaded: batchMedia.filter((entry) => entry.status === 'downloaded').length,
         videos: batchMedia.filter((entry) => entry.status === 'downloaded' && entry.contentType?.startsWith('video/')).length,
         skippedTooLarge: batchMedia.filter((entry) => entry.status === 'skipped_too_large').length,
@@ -283,7 +291,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         networkErrors: requests.filter((entry) => entry.status == null).length,
         minRemaining: remaining.length ? Math.min(...remaining) : null },
     };
-    saveJson(statePath, { startedAt, pending, paused: summary.paused });
+    saveJson(statePath, { startedAt, pending, timelineCursor, paused: summary.paused });
     saveJson(path.join(previewDir, 'latest-new-ids-full.json'), { generatedAt: summary.generatedAt, newCount: summary.newCount,
       beforeCount: initial.length, afterCount: records.length, ids: [...batchIds], bookmarks: batch });
     saveJson(path.join(previewDir, 'latest-fetch-summary.json'), summary);

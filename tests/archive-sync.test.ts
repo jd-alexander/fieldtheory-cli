@@ -156,3 +156,30 @@ test('a no-change sync does not accidentally enrich or download the full archive
     assert.equal(summary.batchCount, 0);
   });
 });
+
+test('a page-limited timeline resumes its saved cursor rather than skipping to the new head', async () => {
+  await withArchive(async (directory, write) => {
+    const result = { added: 1, addedIds: ['new'], totalBookmarks: 2, pages: 12,
+      bookmarkedAtRepaired: 0, bookmarkedAtMissing: 2, stopReason: 'max pages reached', cachePath: '', statePath: '' };
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+      timeline: async () => {
+        write([record('new'), record('old')]);
+        writeFileSync(path.join(directory, 'bookmarks-backfill-state.json'), JSON.stringify({ lastCursor: 'next-page' }));
+        return result;
+      },
+    });
+    const statePath = path.join(directory, 'logs/archive-sync-state.json');
+    assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).timelineCursor, 'next-page');
+    execFileSync('git', ['-C', directory, 'add', '-A']);
+    execFileSync('git', ['-C', directory, 'commit', '-m', 'Save page boundary']);
+    process.exitCode = 0;
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+      timeline: async (options) => {
+        assert.equal(options?.resumeCursor, 'next-page');
+        return { ...result, added: 0, addedIds: [], pages: 1, stopReason: 'end of bookmarks' };
+      },
+      threads: async () => { throw new HttpSafetyStopError('fixture stop', 'request budget reached'); },
+    });
+    assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).timelineCursor, undefined);
+  });
+});
