@@ -1424,6 +1424,18 @@ test('syncThreads: rechecks recent empty threads but skips old checked empties',
   }, [recentChecked, oldChecked]);
 });
 
+test('syncThreads: a selected old tweet is checked without scanning unrelated recent tweets', async () => {
+  const newest = makeRecord({ id: 'newest', tweetId: 'newest', postedAt: '2026-10-18T00:00:00Z' });
+  const old = makeRecord({ id: 'old', tweetId: 'old-tweet', postedAt: '2020-01-01T00:00:00Z' });
+  await withIsolatedGapFillDataDir(async () => {
+    const calls: string[] = [];
+    const result = await syncThreads({ onlyTweetIds: ['old-tweet'], delayMs: 0,
+      threadFetcher: async (record) => { calls.push(record.id); return { context: [], below: [], status: 'ok' }; } });
+    assert.deepEqual(calls, ['old']);
+    assert.equal(result.total, 1);
+  }, [newest, old]);
+});
+
 test('syncThreads: recentLimit restricts expansion to newest bookmarks', async () => {
   const newest = makeRecord({
     id: 'newest',

@@ -4,6 +4,7 @@
   "description": "Field Theory CLI. Self-custody for your X/Twitter bookmarks. Local sync, full-text search, classification, and terminal dashboards.",
   "type": "module",
   "bin": {
+    "x-bookmark-sync": "bin/x-bookmark-sync.mjs",
     "ft": "bin/ft.mjs",
     "fieldtheory": "bin/ft.mjs"
   },
@@ -17,6 +18,8 @@
   "files": [
     "bin/",
     "dist/",
+    "skills/x-bookmark-sync/",
+    "docs/bookmark-sync.md",
     "LICENSE",
     "README.md"
   ],

@@ -1,0 +1,4 @@
+interface:
+  display_name: "X Bookmark Sync"
+  short_description: "Sync and publish the local X bookmark archive"
+  default_prompt: "Use $x-bookmark-sync to sync my latest bookmarks and report captured content and any unfinished work."

@@ -9,7 +9,10 @@ npm run build        # Compile TypeScript to dist/
 npm run dev          # Run via tsx directly
 npm run test         # Run tests
 npm run start        # Run compiled dist/cli.js
+node bin/x-bookmark-sync.mjs  # Complete archive workflow (build first)
 ```
+
+The reusable bookmark synchronization command and shared Claude/Codex skill are documented in `docs/bookmark-sync.md`. Use that command for Joel's routine bookmark sync requests; it includes export and archive Git publication.
 
 ## Architecture
 

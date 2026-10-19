@@ -1,0 +1,47 @@
+# Bookmark Archive Sync
+
+`x-bookmark-sync` is a deterministic command any code agent or a terminal can run. It uses the extraction engine in this repository; no LLM is needed to process each post.
+
+```bash
+x-bookmark-sync
+```
+
+It fetches the latest bookmarks, expands the selected batch's same-author threads, fills quoted text and article gaps, downloads images and capped videos, reconciles recent X folders, rebuilds search and Markdown, writes an HTML preview, and commits/pushes the archive's current branch to `origin`. Folder reconciliation stops when the selected bookmarks have folder tags; a routine sync is not a full historical crawl. With no pending folder targets it refreshes the folder inventory only.
+
+## Installation
+
+Requires Node.js 20+, installed repository dependencies, Git/Git LFS, an existing clean archive repository and a configured X browser session. Install dependencies with `npm ci` on a fresh checkout, then:
+
+```bash
+npm run build
+mkdir -p ~/.local/bin ~/.codex/skills ~/.claude/skills
+ln -s "$PWD/bin/x-bookmark-sync.mjs" ~/.local/bin/x-bookmark-sync
+ln -s "$PWD/skills/x-bookmark-sync" ~/.codex/skills/x-bookmark-sync
+ln -s "$PWD/skills/x-bookmark-sync" ~/.claude/skills/x-bookmark-sync
+```
+
+Do not overwrite an existing command or skill without inspecting it. Keep `~/.local/bin` on PATH, or call `~/.local/bin/x-bookmark-sync` directly. Rebuild after updating the command source. The shared skill is available as `/x-bookmark-sync` in Claude and `$x-bookmark-sync` in Codex when their skill discovery loads it. Other agents can run the command directly.
+
+## Options And Results
+
+```bash
+x-bookmark-sync --check       # Local prerequisites and remaining request allowance
+x-bookmark-sync --no-push     # Fetch and export, leaving changes uncommitted
+x-bookmark-sync --help
+```
+
+`--data-dir` or `FT_DATA_DIR` selects another archive, which must be the root of its own Git checkout. Browser/profile selectors are available in `--help`. Default budgets cover the whole process: 240 controlled requests, at most 300 including requests in the last hour's saved audit logs, minimum 3-second spacing plus jitter, and a remaining-rate floor of 120. Thread expansion also spaces requests by 5 seconds. Audited requests made by this CLI contribute to the hourly check; browser traffic and other tools are not measurable through these logs.
+
+The command locks concurrent invocations for the same archive, requires a clean initial working tree, fetches and fast-forwards the archive, and preserves pending stage IDs. An extraction pause still exports and publishes saved progress. It does not loop around the guardrails or force-push. A failed push leaves the commit locally for inspection/retry. No cookie/token values are passed on the command line or stored in the skill.
+
+Exit codes: **0** completed planned stages, **1** error, **2** partial progress with queued work. Check `previews/latest-fetch-summary.json` for individual extraction failures even on exit 0. Oversized media remains linked with a recorded skip reason. Deleted/inaccessible posts and unavailable external pages cannot be guaranteed complete. The HTML preview includes captured batch data and local assets; the foldered Markdown excludes bookmarks whose folder membership is still unknown, while raw JSONL preserves them.
+
+## Agent Instructions
+
+Add this to a project's `AGENTS.md` or `CLAUDE.md` to route bookmark requests:
+
+```markdown
+## X Bookmark Synchronization
+
+For a request to sync/fetch X or Twitter bookmarks, run `~/.local/bin/x-bookmark-sync` from any directory. The workflow is in `~/Apps/fieldtheory-cli/skills/x-bookmark-sync/SKILL.md`. It saves to `~/.fieldtheory/bookmarks`, enriches threads/articles/media, generates Markdown/HTML, and commits/pushes the archive. Inspect `previews/latest-fetch-summary.json` and report pending work accurately. Respect a guardrail pause; do not increase budgets or repeatedly restart to exhaust X. Use `--no-push` only when the user requests local changes. Bookmark sync does not mean pulling the current project's Git repository.
+```

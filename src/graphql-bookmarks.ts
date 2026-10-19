@@ -2499,6 +2499,8 @@ function isPermanentThreadFailure(status: TweetFetchResult['status'] | null): bo
 export interface SyncThreadsOptions {
   onProgress?: (progress: ThreadSyncProgress) => void;
   delayMs?: number;
+  /** Restrict expansion to a captured batch, independent of tweet publication date. */
+  onlyTweetIds?: string[];
   /** Only consider the newest N bookmarks for thread expansion. */
   recentLimit?: number;
   /** Hard cap after filtering candidates. */
@@ -2619,7 +2621,11 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
   const records = loaded.records;
   const nowMs = Date.now();
   const now = new Date(nowMs).toISOString();
-  const candidatePool = recentThreadCandidatePool(records, options.recentLimit);
+  const scopedIds = new Set(options.onlyTweetIds ?? []);
+  const scopedRecords = scopedIds.size > 0
+    ? records.filter((record) => scopedIds.has(record.id) || scopedIds.has(record.tweetId))
+    : records;
+  const candidatePool = recentThreadCandidatePool(scopedRecords, options.recentLimit);
   let candidates = candidatePool.filter((record) => shouldSyncThread(record, nowMs));
   if (options.limit != null) {
     candidates = candidates.slice(0, Math.max(0, Math.floor(options.limit)));
