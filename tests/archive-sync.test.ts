@@ -183,3 +183,35 @@ test('a page-limited timeline resumes its saved cursor rather than skipping to t
     assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).timelineCursor, undefined);
   });
 });
+
+test('a large capture finishes media for ten bookmarks before expanding the next group of threads', async () => {
+  await withArchive(async (directory, write) => {
+    const records = Array.from({ length: 14 }, (_, i) => ({ ...record(String(i)), folderIds: ['f'], folderNames: ['Research'] }));
+    const calls: string[] = [];
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+      timeline: async () => {
+        write([...records, record('old')]);
+        return { added: 14, addedIds: records.map((r) => r.id), totalBookmarks: 15, pages: 1,
+          bookmarkedAtRepaired: 0, bookmarkedAtMissing: 15, stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' };
+      },
+      threads: async (options) => {
+        calls.push(`threads:${options?.onlyTweetIds?.length}`);
+        return { total: 0, contextFilled: 0, belowFilled: 0, emptyChecked: 0, failed: 0, failures: [] };
+      },
+      gaps: async (options) => {
+        calls.push(`gaps:${options?.onlyTweetIds?.length}`);
+        return { total: 0, quotedTweetsFilled: 0, textExpanded: 0, articlesEnriched: 0, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 0, failed: 0, failures: [] };
+      },
+      media: async (options) => {
+        calls.push(`media:${options?.onlyTweetIds?.length}`);
+        return { schemaVersion: 1, generatedAt: '', limit: 0, maxBytes: 10, processed: 0, downloaded: 0, failed: 0, skippedTooLarge: 0, entries: [] };
+      },
+      folders: async () => ({ folders: [], perFolder: [], targetFolderCount: 0, totalAdded: 0,
+        totalTagged: 0, totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [] }),
+    });
+    assert.deepEqual(calls, ['threads:10', 'gaps:10', 'media:10', 'threads:4', 'gaps:4', 'media:4']);
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    assert.equal(summary.newCount, 14);
+    assert.ok(Object.values(summary.pending).every((ids: any) => ids.length === 0));
+  });
+});

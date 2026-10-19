@@ -6,7 +6,7 @@
 x-bookmark-sync
 ```
 
-It fetches the latest bookmarks, expands the selected batch's same-author threads, fills quoted text and article gaps, downloads images and capped videos, reconciles recent X folders, rebuilds search and Markdown, writes an HTML preview, and commits/pushes the archive's current branch to `origin`. Folder reconciliation stops when the selected bookmarks have folder tags; a routine sync is not a full historical crawl. With no pending folder targets it refreshes the folder inventory only.
+It fetches the latest bookmarks, then enriches groups of ten: same-author threads, quoted text and article gaps, followed by images and capped videos. It then reconciles recent X folders, rebuilds search and Markdown, writes an HTML preview, and commits/pushes the archive's current branch to `origin`. Earlier unfinished captures are prioritized, so a large thread backlog does not take all the budget ahead of its own media. Folder reconciliation stops when the selected bookmarks have folder tags; a routine sync is not a full historical crawl. With no pending folder targets it refreshes the folder inventory only.
 
 ## Installation
 

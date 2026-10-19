@@ -226,26 +226,45 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const newIds = captured.filter((record) => !beforeIds.has(record.id)).map((record) => record.id);
     for (const stage of Object.keys(pending) as Stage[]) pending[stage] = [...new Set([...pending[stage], ...newIds])];
     persistState();
-    const completeStage = (stage: Stage): void => {
-      pending[stage] = [];
+    const completeStage = (stage: Stage, ids: string[]): void => {
+      const completed = new Set(ids);
+      pending[stage] = pending[stage].filter((id) => !completed.has(id));
       persistState();
     };
+    const attempted = new Set<string>();
+    const gapFailures: unknown[] = [];
+    let chunk = 0;
     const enrich = async (): Promise<void> => {
-      if (pending.threads.length) {
-        const threads = await run('threads', () => services.threads({ ...auth, onlyTweetIds: pending.threads, delayMs: 5000,
-          onProgress: (p) => console.log(`[threads] ${p.done}/${p.total}, ${p.belowFilled} continuation chains`) }));
-        if (threads) completeStage('threads');
-      }
-      if (pending.gaps.length) {
-        const gaps = await run('gaps', () => services.gaps({ ...auth, onlyTweetIds: pending.gaps, articleLimit: pending.gaps.length, delayMs: 5000,
-          onProgress: (p) => console.log(`[gaps] ${p.done}/${p.total}, ${p.articlesEnriched} articles, ${p.failed} misses`) }));
-        if (gaps) { saveJson(path.join(directory, 'gaps-failures.json'), { failures: gaps.failures }); completeStage('gaps'); }
-      }
-      if (pending.media.length) {
-        const media = await run('media', () => services.media({ onlyTweetIds: pending.media, skipProfileImages: true, mediaQuality: 'large',
-          onProgress: (p) => console.log(`[media] ${p.processed} processed, ${p.downloaded} downloaded, ${p.failed} failed`) }));
-        if (media?.stopReason) paused = media.stopReason;
-        else if (media && media.failed === 0) completeStage('media');
+      while (!paused) {
+        // Finish earlier captures before moving into new thread work.
+        const ids = [...new Set([...pending.media, ...pending.gaps, ...pending.threads])].filter((id) => !attempted.has(id)).slice(0, 10);
+        if (!ids.length) break;
+        ids.forEach((id) => attempted.add(id));
+        chunk++;
+        const selected = (stage: Stage): string[] => pending[stage].filter((id) => ids.includes(id));
+        const threadIds = selected('threads');
+        if (threadIds.length) {
+          const threads = await run(`threads-${chunk}`, () => services.threads({ ...auth, onlyTweetIds: threadIds, delayMs: 5000,
+            onProgress: (p) => console.log(`[threads] ${p.done}/${p.total}, ${p.belowFilled} continuation chains`) }));
+          if (threads) completeStage('threads', threadIds);
+        }
+        const gapIds = selected('gaps');
+        if (gapIds.length) {
+          const gaps = await run(`gaps-${chunk}`, () => services.gaps({ ...auth, onlyTweetIds: gapIds, articleLimit: gapIds.length, delayMs: 5000,
+            onProgress: (p) => console.log(`[gaps] ${p.done}/${p.total}, ${p.articlesEnriched} articles, ${p.failed} misses`) }));
+          if (gaps) {
+            gapFailures.push(...gaps.failures);
+            saveJson(path.join(directory, 'gaps-failures.json'), { failures: gapFailures });
+            completeStage('gaps', gapIds);
+          }
+        }
+        const mediaIds = selected('media');
+        if (mediaIds.length) {
+          const media = await run(`media-${chunk}`, () => services.media({ onlyTweetIds: mediaIds, skipProfileImages: true, mediaQuality: 'large',
+            onProgress: (p) => console.log(`[media] ${p.processed} processed, ${p.downloaded} downloaded, ${p.failed} failed`) }));
+          if (media?.stopReason) paused = media.stopReason;
+          else if (media && media.failed === 0) completeStage('media', mediaIds);
+        }
       }
     };
     await enrich();
