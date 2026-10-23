@@ -27,6 +27,7 @@ Do not overwrite an existing command or skill without inspecting it. Keep `~/.lo
 ```bash
 x-bookmark-sync --check       # Local prerequisites and remaining request allowance
 x-bookmark-sync --no-push     # Fetch and export, leaving changes uncommitted
+x-bookmark-sync --focus-folder Ads --comments 3  # Prioritize Ads and archive public conversations
 x-bookmark-sync --help
 ```
 
@@ -35,6 +36,8 @@ x-bookmark-sync --help
 The command locks concurrent invocations for the same archive, requires a clean initial working tree, fetches and fast-forwards the archive, and preserves pending stage IDs and any unfinished timeline cursor. A later sync resumes that cursor before returning to ordinary head checks. An extraction pause still exports and publishes saved progress. It does not loop around the guardrails or force-push. A failed push leaves the commit locally for inspection/retry. No cookie/token values are passed on the command line or stored in the skill.
 
 Exit codes: **0** completed planned stages, **1** error, **2** partial progress with queued work. Check `previews/latest-fetch-summary.json` for individual extraction failures even on exit 0. Oversized media remains linked with a recorded skip reason. Deleted/inaccessible posts and unavailable external pages cannot be guaranteed complete. The HTML preview includes captured batch data and local assets; the foldered Markdown excludes bookmarks whose folder membership is still unknown, while raw JSONL preserves them.
+
+`--focus-folder Ads --comments 3` syncs that folder before the enrichment backlog and captures three conversations selected by reply activity among its ten latest saved posts. Recency uses folder bookmark positions, including newly saved older posts. Conversation Markdown includes other participants, author responses and follow-up branches. It uses at most six root pages and six one-page branch expansions per post by default; `--comment-pages` and `--comment-branches` adjust those bounds. API-visible replies may be incomplete because of these caps or X visibility restrictions. Each capture's path and counts appear in the sync summary. Interrupted conversation IDs remain queued, and their requests share the normal run allowance.
 
 ## Agent Instructions
 

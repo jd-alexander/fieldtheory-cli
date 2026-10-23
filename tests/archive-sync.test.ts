@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'nod
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireSyncLock, archiveSyncMain, availableRequestBudget, renderBatchPreview } from '../src/archive-sync.js';
+import { acquireSyncLock, archiveSyncMain, availableRequestBudget, recentFolderBookmarks, renderBatchPreview } from '../src/archive-sync.js';
 import { HttpSafetyStopError } from '../src/http-safety.js';
 import type { BookmarkRecord } from '../src/types.js';
 
@@ -213,5 +213,72 @@ test('a large capture finishes media for ten bookmarks before expanding the next
     const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
     assert.equal(summary.newCount, 14);
     assert.ok(Object.values(summary.pending).every((ids: any) => ids.length === 0));
+  });
+});
+
+test('focused folder ordering uses bookmark positions even for recently saved older tweets', () => {
+  const savedOlderTweet = { ...record('older-tweet'), postedAt: '2018-01-01T00:00:00Z', folderNames: ['Other', 'Ads'], folderSortIndices: ['1', '1000'] };
+  const newerTweet = { ...record('newer-tweet'), postedAt: '2026-10-23T00:00:00Z', folderNames: ['Ads'], folderSortIndices: ['999'] };
+  assert.deepEqual(recentFolderBookmarks([newerTweet, record('unrelated'), savedOlderTweet], 'ads').map((r) => r.id), ['older-tweet', 'newer-tweet']);
+});
+
+test('focused conversations run before old backlog and include newly discovered folder bookmarks', async () => {
+  await withArchive(async (directory, write) => {
+    mkdirSync(path.join(directory, 'logs'));
+    writeFileSync(path.join(directory, 'logs/archive-sync-state.json'), JSON.stringify({ pending: { media: ['old'] } }));
+    execFileSync('git', ['-C', directory, 'add', '-A']);
+    execFileSync('git', ['-C', directory, 'commit', '-m', 'Save backlog']);
+    const focused = ['a', 'b', 'c'].map((id, i) => ({ ...record(id), folderIds: ['f'], folderNames: ['Ads'], folderSortIndices: [String(1000 - i)], engagement: { replyCount: [10, 90, 20][i] } }));
+    const phases: string[] = [];
+    const emptyFolders = { folders: [], perFolder: [], targetFolderCount: 0, totalAdded: 0, totalTagged: 0, totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [] };
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--focus-folder', 'Ads', '--comments', '2'], {
+      timeline: async () => ({ added: 0, totalBookmarks: 1, pages: 1, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 1,
+        stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' }),
+      folders: async (options) => {
+        if (options?.onlyFolderName) { phases.push('focus'); write([...focused, record('old')]); }
+        return emptyFolders;
+      },
+      conversation: async (options) => {
+        phases.push(`comments:${options.tweetId}`);
+        assert.equal(options.expandBranches, true);
+        const out = path.join(directory, `conversation-${options.tweetId}.md`);
+        writeFileSync(out, 'Captured public replies');
+        return { path: out, status: 'ok', tweetCount: 12, authorReplyCount: 3, participantCount: 7,
+          topLevelReplyCount: 4, branchFetches: 2, branchTweetsAdded: 3 };
+      },
+      threads: async (options) => {
+        phases.push('threads');
+        assert.deepEqual(options?.onlyTweetIds, ['a', 'b', 'c']);
+        return { total: 0, contextFilled: 0, belowFilled: 0, emptyChecked: 0, failed: 0, failures: [] };
+      },
+      gaps: async () => ({ total: 0, quotedTweetsFilled: 0, textExpanded: 0, articlesEnriched: 0, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 0, failed: 0, failures: [] }),
+      media: async (options) => {
+        phases.push('media');
+        assert.deepEqual(options?.onlyTweetIds, ['a', 'b', 'c', 'old']);
+        return { schemaVersion: 1, generatedAt: '', limit: 0, maxBytes: 10, processed: 0, downloaded: 0, failed: 0, skippedTooLarge: 0, entries: [] };
+      },
+    });
+    assert.deepEqual(phases, ['focus', 'comments:b', 'comments:c', 'threads', 'media']);
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    assert.equal(summary.newCount, 3);
+    assert.equal(summary.conversations.length, 2);
+    assert.deepEqual(summary.pendingConversations, []);
+    assert.deepEqual(summary.pending.folders, []);
+  });
+});
+
+test('a conversation guardrail saves its pending ID and skips older enrichment', async () => {
+  await withArchive(async (directory, write) => {
+    const focused = { ...record('ad'), folderIds: ['f'], folderNames: ['Ads'], folderSortIndices: ['999'] };
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--focus-folder', 'Ads', '--comments', '1'], {
+      timeline: async () => ({ added: 0, totalBookmarks: 1, pages: 1, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 1,
+        stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' }),
+      folders: async () => { write([focused, record('old')]); return { folders: [], perFolder: [], targetFolderCount: 0, totalAdded: 1, totalTagged: 0, totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [] }; },
+      conversation: async () => { throw new HttpSafetyStopError('fixture stop', 'request budget reached'); },
+      threads: async () => { throw new Error('must not run older threads after a conversation stop'); },
+    });
+    const state = JSON.parse(readFileSync(path.join(directory, 'logs/archive-sync-state.json'), 'utf8'));
+    assert.deepEqual(state.pendingConversations, ['ad']);
+    assert.equal(process.exitCode, 2);
   });
 });

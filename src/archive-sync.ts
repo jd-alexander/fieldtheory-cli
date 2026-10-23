@@ -11,6 +11,8 @@ import { syncBookmarksGraphQL, syncBookmarkFolders, syncThreads, syncGaps } from
 import { fetchBookmarkMediaBatch, type MediaFetchEntry } from './bookmark-media.js';
 import { exportReadableBookmarkArchive } from './bookmark-folder-export.js';
 import { buildIndex } from './bookmarks-db.js';
+import { exportTweetConversationMarkdown } from './tweet-conversation-export.js';
+import { parseSnowflake } from './tweet-snapshots.js';
 import type { BookmarkRecord, ThreadTweetSnapshot } from './types.js';
 
 type Stage = 'threads' | 'gaps' | 'media' | 'folders';
@@ -22,7 +24,7 @@ interface AuditEntry {
   errorName?: string;
   responseHeaders?: Record<string, string>;
 }
-interface SyncState { pending?: Pending; timelineCursor?: string; }
+interface SyncState { pending?: Pending; timelineCursor?: string; pendingConversations?: string[]; }
 
 interface ArchiveSyncServices {
   timeline: typeof syncBookmarksGraphQL;
@@ -30,6 +32,19 @@ interface ArchiveSyncServices {
   gaps: typeof syncGaps;
   media: typeof fetchBookmarkMediaBatch;
   folders: typeof syncBookmarkFolders;
+  conversation: typeof exportTweetConversationMarkdown;
+}
+
+export function recentFolderBookmarks(records: BookmarkRecord[], name: string, limit = 10): BookmarkRecord[] {
+  const folderIndex = (record: BookmarkRecord): number => record.folderNames?.findIndex((value) => value.toLowerCase() === name.toLowerCase()) ?? -1;
+  const order = (record: BookmarkRecord): bigint | null => parseSnowflake(record.folderSortIndices?.[folderIndex(record)] ?? record.sortIndex);
+  return records.filter((record) => folderIndex(record) >= 0).sort((a, b) => {
+    const aOrder = order(a);
+    const bOrder = order(b);
+    if (aOrder != null && bOrder != null && aOrder !== bOrder) return aOrder > bOrder ? -1 : 1;
+    return (Date.parse(b.bookmarkedAt ?? b.syncedAt ?? b.postedAt ?? '') || 0)
+      - (Date.parse(a.bookmarkedAt ?? a.syncedAt ?? a.postedAt ?? '') || 0);
+  }).slice(0, limit);
 }
 
 function jsonFile<T>(file: string, fallback: T): T {
@@ -133,7 +148,7 @@ export function renderBatchPreview(records: BookmarkRecord[], entries: MediaFetc
 
 export async function archiveSyncMain(argv = process.argv, overrides: Partial<ArchiveSyncServices> = {}): Promise<void> {
   const services: ArchiveSyncServices = { timeline: syncBookmarksGraphQL, threads: syncThreads, gaps: syncGaps,
-    media: fetchBookmarkMediaBatch, folders: syncBookmarkFolders, ...overrides };
+    media: fetchBookmarkMediaBatch, folders: syncBookmarkFolders, conversation: exportTweetConversationMarkdown, ...overrides };
   const positive = (value: string): number => {
     const parsed = Number(value);
     if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error('Expected a positive integer.');
@@ -146,12 +161,17 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     .option('--request-budget <n>', 'Total controlled requests across all stages', positive, 240)
     .option('--hourly-budget <n>', 'Maximum requests including recent saved audit logs', positive, 300)
     .option('--recent-folders <n>', 'Maximum folders to reconcile in X order', positive, 20)
+    .option('--focus-folder <name>', 'Sync and prioritize this folder before the older enrichment backlog')
+    .option('--comments <n>', 'Capture N conversations from the ten latest focused bookmarks, prioritizing reply activity', positive, 0)
+    .option('--comment-pages <n>', 'Maximum root conversation pages per focused bookmark', positive, 6)
+    .option('--comment-branches <n>', 'Maximum reply branches expanded per focused bookmark', positive, 6)
     .option('--time-zone <name>', 'Time zone for archive commit dates', process.env.FT_TIME_ZONE ?? 'America/Jamaica')
     .option('--browser <name>', 'Browser session to use')
     .option('--chrome-profile-directory <name>', 'Chrome-family browser profile')
     .option('--firefox-profile-dir <path>', 'Firefox profile');
   program.parse(argv);
   const options = program.opts();
+  if (options.comments && !options.focusFolder) throw new Error('--comments requires --focus-folder.');
   const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: options.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
   if (options.dataDir) process.env.FT_DATA_DIR = path.resolve(options.dataDir);
   const directory = path.resolve(dataDir());
@@ -179,6 +199,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const statePath = path.join(logs, 'archive-sync-state.json');
     const saved = jsonFile<SyncState>(statePath, {});
     let timelineCursor = saved.timelineCursor;
+    let pendingConversations = [...new Set(saved.pendingConversations ?? [])];
     const pending: Pending = { threads: [], gaps: [], media: [], folders: [], ...saved.pending };
     const startedAt = new Date().toISOString();
     const runId = startedAt.replace(/[:.]/g, '-');
@@ -189,7 +210,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       requestBudget: Math.max(1, allowance), maxRequestsPerHour: options.hourlyBudget, rateLimitFloor: 120 });
     const auth = { browser: options.browser, chromeProfileDirectory: options.chromeProfileDirectory, firefoxProfileDir: options.firefoxProfileDir };
     const stages: Record<string, unknown> = {};
-    const persistState = (): void => saveJson(statePath, { startedAt, pending, timelineCursor });
+    const persistState = (): void => saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations });
     let paused: string | undefined = allowance === 0 ? 'hourly request budget reached' : undefined;
     const freshAudit = (): AuditEntry[] => auditEntries(logs).filter((entry) => entry.ts >= startedAt);
     const run = async <T>(name: string, task: () => Promise<T>): Promise<T | undefined> => {
@@ -222,10 +243,39 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         timelineCursor = jsonFile<{ lastCursor?: string }>(path.join(directory, 'bookmarks-backfill-state.json'), {}).lastCursor ?? timelineCursor;
       }
     }
+    if (options.focusFolder) {
+      await run('focus-folder', () => services.folders({ ...auth, onlyFolderName: options.focusFolder, delayMs: 3000,
+        onProgress: (p) => { if (p.folder && p.phase === 'walking') console.log(`[focus-folder] ${p.folder.name}`); } }));
+    }
     const captured = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
     const newIds = captured.filter((record) => !beforeIds.has(record.id)).map((record) => record.id);
     for (const stage of Object.keys(pending) as Stage[]) pending[stage] = [...new Set([...pending[stage], ...newIds])];
+    const focused = options.focusFolder ? recentFolderBookmarks(captured, options.focusFolder) : [];
+    const conversationTargets = options.comments ? [...focused].sort((a, b) =>
+      (b.engagement?.replyCount ?? 0) - (a.engagement?.replyCount ?? 0)).slice(0, options.comments) : [];
+    pendingConversations = [...new Set([...pendingConversations, ...conversationTargets.map((record) => record.tweetId)])];
+    if (options.focusFolder) {
+      const focusedIds = focused.map((record) => record.id);
+      for (const stage of ['threads', 'gaps', 'media'] as Stage[]) {
+        pending[stage] = [...new Set([...focusedIds, ...pending[stage]])];
+      }
+      const tagged = new Set(captured.filter((record) => record.folderIds?.length).map((record) => record.id));
+      pending.folders = pending.folders.filter((id) => !tagged.has(id));
+    }
     persistState();
+    const conversations = [];
+    for (const tweetId of [...pendingConversations]) {
+      if (paused) break;
+      const result = await run(`comments-${tweetId}`, () => services.conversation({ ...auth, tweetId,
+        maxPages: options.commentPages, expandBranches: true, branchLimit: options.commentBranches,
+        branchMaxPages: 1, delayMs: 5000 }));
+      if (!result) break;
+      conversations.push({ tweetId, ...result, maxPages: options.commentPages, branchLimit: options.commentBranches });
+      console.log(`[comments] ${tweetId}: ${result.tweetCount} tweets, ${result.authorReplyCount} author replies, ${result.participantCount} participants`);
+      if (result.status === 'ok') pendingConversations = pendingConversations.filter((id) => id !== tweetId);
+      else paused = `Conversation ${tweetId} returned ${result.status}`;
+      persistState();
+    }
     const completeStage = (stage: Stage, ids: string[]): void => {
       const completed = new Set(ids);
       pending[stage] = pending[stage].filter((id) => !completed.has(id));
@@ -285,7 +335,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       await enrich();
     }
     const finalRecords = folderOnlyIds.length ? await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath()) : records;
-    const batchIds = new Set([...newIds, ...folderOnlyIds, ...Object.values(saved.pending ?? {}).flat()]);
+    const batchIds = new Set([...newIds, ...folderOnlyIds, ...focused.map((record) => record.id), ...Object.values(saved.pending ?? {}).flat()]);
     const batch = finalRecords.filter((record) => batchIds.has(record.id));
     await buildIndex({ force: true });
     const exported = await exportReadableBookmarkArchive({ clean: true, includeUnfiled: false });
@@ -301,7 +351,10 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const summary = {
       startedAt, generatedAt: new Date().toISOString(), beforeCount: initial.length, afterCount: records.length,
       newCount: records.length - initial.length, batchCount: batch.length, paused: paused ?? null,
-      pending, timelineCursor, stages, exported, previewPath,
+      pending, pendingConversations, conversations, focusFolder: options.focusFolder,
+      conversationTargets: conversationTargets.map((record) => ({ tweetId: record.tweetId, url: record.url,
+        authorHandle: record.authorHandle, text: record.text.slice(0, 240), reportedReplies: record.engagement?.replyCount })),
+      timelineCursor, stages, exported, previewPath,
       media: { downloaded: batchMedia.filter((entry) => entry.status === 'downloaded').length,
         videos: batchMedia.filter((entry) => entry.status === 'downloaded' && entry.contentType?.startsWith('video/')).length,
         skippedTooLarge: batchMedia.filter((entry) => entry.status === 'skipped_too_large').length,
@@ -310,7 +363,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         networkErrors: requests.filter((entry) => entry.status == null).length,
         minRemaining: remaining.length ? Math.min(...remaining) : null },
     };
-    saveJson(statePath, { startedAt, pending, timelineCursor, paused: summary.paused });
+    saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations, paused: summary.paused });
     saveJson(path.join(previewDir, 'latest-new-ids-full.json'), { generatedAt: summary.generatedAt, newCount: summary.newCount,
       beforeCount: initial.length, afterCount: records.length, ids: [...batchIds], bookmarks: batch });
     saveJson(path.join(previewDir, 'latest-fetch-summary.json'), summary);
@@ -322,7 +375,8 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       console.log(`Pushed ${git(directory, 'rev-parse', '--short', 'HEAD')} to origin/${branch}`);
     }
     console.log(JSON.stringify({ newCount: summary.newCount, afterCount: summary.afterCount, media: summary.media,
-      audit: summary.audit, paused: summary.paused, pending, previewPath }, null, 2));
-    if (paused || Object.values(pending).some((ids) => ids.length)) process.exitCode = 2;
+      audit: summary.audit, paused: summary.paused, pending: Object.fromEntries(Object.entries(pending).map(([stage, ids]) => [stage, ids.length])),
+      pendingConversations, conversations, previewPath }, null, 2));
+    if (paused || pendingConversations.length || Object.values(pending).some((ids) => ids.length)) process.exitCode = 2;
   } finally { release(); }
 }

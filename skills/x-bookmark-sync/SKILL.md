@@ -22,6 +22,8 @@ The command uses the existing browser session through the CLI, without GUI autom
 
 It combines the incremental all-bookmarks feed with folder reconciliation. It enriches ten bookmarks at a time: same-author threads regardless of tweet age, quoted/long text and article gaps, then media up to 200 MiB per asset. Earlier unfinished captures are prioritized. Captured folders and deleted tweet history are preserved. Bookmarks awaiting folder reconciliation remain in the raw archive and preview; they are not assigned an invented "untagged" folder.
 
+When Joel asks for comments from a folder, use `~/.local/bin/x-bookmark-sync --focus-folder Ads --comments 3` (replace the folder and count as appropriate). This refreshes that folder and captures public conversations before the older enrichment backlog. It chooses by reply activity among the ten latest folder bookmarks, preserving bookmark order for older saved tweets. The summary lists conversation Markdown paths, participant counts and author replies. Captures have page and branch bounds and can be incomplete; report them accurately. Interrupted conversation IDs are queued for the next run.
+
 One request controller is shared across the stages. The default run budget is 240 controlled requests, with a 300-request hourly allowance checked against saved audit logs, a remaining-rate floor of 120, and request spacing. These limits reduce load; they cannot guarantee against X restrictions. Do not restart with larger budgets to get around a pause. Exit 2 means partial progress was saved and remaining work is queued for a later sync. Exit 1 means an error needs inspection. Exit 0 means the planned stages completed; still report individual extraction misses.
 
 Inspect the outputs before reporting success:
