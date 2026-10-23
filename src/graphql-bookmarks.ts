@@ -1587,6 +1587,8 @@ export interface BookmarkFolderStateEntry {
   lastSyncedAt?: string;
   recordCount?: number;
   recordIdsHash?: string;
+  /** Unique record IDs in live folder pagination order, newest saved first. */
+  orderedRecordIds?: string[];
   lastStats?: FolderMirrorStats;
   lastSkippedAt?: string;
   lastSkippedReason?: string;
@@ -1671,6 +1673,7 @@ function updateFolderSyncedState(
           lastSyncedAt: syncedAt,
           recordCount: walkedRecords.length,
           recordIdsHash: hashFolderRecordIds(walkedRecords),
+          orderedRecordIds: walkedRecords.map((record) => record.id),
           lastStats: stats,
           lastSkippedAt: undefined,
           lastSkippedReason: undefined,

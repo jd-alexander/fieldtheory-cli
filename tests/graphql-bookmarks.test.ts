@@ -21,6 +21,7 @@ import {
   applyFolderMirror,
   clearFolderEverywhere,
   fetchBookmarkFolders,
+  syncBookmarkFolders,
   formatSyncResult,
   hashFolderRecordIds,
   getFolderTagCoverage,
@@ -2524,6 +2525,31 @@ test('fetchBookmarkFolders: follows BookmarkFoldersSlice pagination', async () =
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('folder snapshots preserve page order when X reuses sort indices across pages', async () => {
+  await withIsolatedGapFillDataDir(async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.includes('BookmarkFoldersSlice')) {
+        return new Response(JSON.stringify({ data: { bookmark_collections_slice: { items: [{ id: 'folder', name: 'Ads' }] } } }), { status: 200 });
+      }
+      const variables = JSON.parse(url.searchParams.get('variables') ?? '{}');
+      const firstPage = !variables.cursor;
+      const id = firstPage ? '1000000000000000001' : '1000000000000000002';
+      const entries: any[] = [{ entryId: `tweet-${id}`, sortIndex: '20', content: { itemContent: { tweet_results: { result: makeTweetResult({ rest_id: id,
+        legacy: { id_str: id, created_at: firstPage ? 'Tue Jan 01 12:00:00 +0000 2019' : 'Fri Oct 23 12:00:00 +0000 2026' } }) } } } }];
+      if (firstPage) entries.push({ entryId: 'cursor-bottom-1', content: { value: 'second-page' } });
+      return new Response(JSON.stringify({ data: { bookmark_collection_timeline: { timeline: { instructions: [{ type: 'TimelineAddEntries', entries }] } } } }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await syncBookmarkFolders({ csrfToken: 'test', cookieHeader: 'ct0=test', onlyFolderName: 'Ads', delayMs: 0 });
+      const state = JSON.parse(await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmark-folders-state.json'), 'utf8'));
+      assert.deepEqual(state.folders[0].orderedRecordIds, ['1000000000000000001', '1000000000000000002']);
+      assert.equal(state.folders[0].recordCount, 2);
+    } finally { globalThis.fetch = originalFetch; }
+  }, []);
 });
 
 test('parseFolderTimelineResponse: parses bookmark_collection_timeline shape', () => {

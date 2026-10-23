@@ -12,7 +12,6 @@ import { fetchBookmarkMediaBatch, type MediaFetchEntry } from './bookmark-media.
 import { exportReadableBookmarkArchive } from './bookmark-folder-export.js';
 import { buildIndex } from './bookmarks-db.js';
 import { exportTweetConversationMarkdown } from './tweet-conversation-export.js';
-import { parseSnowflake } from './tweet-snapshots.js';
 import type { BookmarkRecord, ThreadTweetSnapshot } from './types.js';
 
 type Stage = 'threads' | 'gaps' | 'media' | 'folders';
@@ -35,15 +34,12 @@ interface ArchiveSyncServices {
   conversation: typeof exportTweetConversationMarkdown;
 }
 
-export function recentFolderBookmarks(records: BookmarkRecord[], name: string, limit = 10): BookmarkRecord[] {
-  const folderIndex = (record: BookmarkRecord): number => record.folderNames?.findIndex((value) => value.toLowerCase() === name.toLowerCase()) ?? -1;
-  const order = (record: BookmarkRecord): bigint | null => parseSnowflake(record.folderSortIndices?.[folderIndex(record)] ?? record.sortIndex);
-  return records.filter((record) => folderIndex(record) >= 0).sort((a, b) => {
-    const aOrder = order(a);
-    const bOrder = order(b);
-    if (aOrder != null && bOrder != null && aOrder !== bOrder) return aOrder > bOrder ? -1 : 1;
-    return (Date.parse(b.bookmarkedAt ?? b.syncedAt ?? b.postedAt ?? '') || 0)
-      - (Date.parse(a.bookmarkedAt ?? a.syncedAt ?? a.postedAt ?? '') || 0);
+export function recentFolderBookmarks(records: BookmarkRecord[], name: string, orderedIds: string[], limit = 10): BookmarkRecord[] {
+  const byId = new Map(records.map((record) => [record.id, record]));
+  // X reuses per-page sortIndex values; only the walked page order is global.
+  return orderedIds.flatMap((id) => {
+    const record = byId.get(id);
+    return record?.folderNames?.some((value) => value.toLowerCase() === name.toLowerCase()) ? [record] : [];
   }).slice(0, limit);
 }
 
@@ -244,13 +240,17 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       }
     }
     if (options.focusFolder) {
-      await run('focus-folder', () => services.folders({ ...auth, onlyFolderName: options.focusFolder, delayMs: 3000,
+      const focusedWalk = await run('focus-folder', () => services.folders({ ...auth, onlyFolderName: options.focusFolder, delayMs: 3000,
         onProgress: (p) => { if (p.folder && p.phase === 'walking') console.log(`[focus-folder] ${p.folder.name}`); } }));
+      if (focusedWalk?.skippedFolders.length) paused = 'Focused folder walk was incomplete';
     }
     const captured = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
     const newIds = captured.filter((record) => !beforeIds.has(record.id)).map((record) => record.id);
     for (const stage of Object.keys(pending) as Stage[]) pending[stage] = [...new Set([...pending[stage], ...newIds])];
-    const focused = options.focusFolder ? recentFolderBookmarks(captured, options.focusFolder) : [];
+    const folderState = jsonFile<{ folders: Array<{ name: string; orderedRecordIds?: string[] }> }>(path.join(directory, 'bookmark-folders-state.json'), { folders: [] });
+    const focusedSnapshot = options.focusFolder ? folderState.folders.find((folder) => folder.name.toLowerCase() === options.focusFolder.toLowerCase()) : undefined;
+    if (options.focusFolder && !focusedSnapshot?.orderedRecordIds && !paused) paused = 'Focused folder has no ordered snapshot';
+    const focused = options.focusFolder ? recentFolderBookmarks(captured, options.focusFolder, focusedSnapshot?.orderedRecordIds ?? []) : [];
     const conversationTargets = options.comments ? [...focused].sort((a, b) =>
       (b.engagement?.replyCount ?? 0) - (a.engagement?.replyCount ?? 0)).slice(0, options.comments) : [];
     pendingConversations = [...new Set([...pendingConversations, ...conversationTargets.map((record) => record.tweetId)])];

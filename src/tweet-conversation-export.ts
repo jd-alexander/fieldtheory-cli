@@ -422,7 +422,7 @@ function buildMarkdown(input: {
   const topLevelReplies = childrenByParent.get(root.id)?.length ?? 0;
 
   const lines = [
-    `# ${root.authorHandle ? `@${root.authorHandle}` : 'X'} UGC Ideas Conversation`,
+    `# ${root.authorHandle ? `@${root.authorHandle}` : 'X'} Conversation`,
     '',
     `- Source: [Root tweet](https://x.com/i/status/${tweetId})`,
     `- Root tweet ID: \`${tweetId}\``,

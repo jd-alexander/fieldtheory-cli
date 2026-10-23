@@ -217,9 +217,9 @@ test('a large capture finishes media for ten bookmarks before expanding the next
 });
 
 test('focused folder ordering uses bookmark positions even for recently saved older tweets', () => {
-  const savedOlderTweet = { ...record('older-tweet'), postedAt: '2018-01-01T00:00:00Z', folderNames: ['Other', 'Ads'], folderSortIndices: ['1', '1000'] };
-  const newerTweet = { ...record('newer-tweet'), postedAt: '2026-10-23T00:00:00Z', folderNames: ['Ads'], folderSortIndices: ['999'] };
-  assert.deepEqual(recentFolderBookmarks([newerTweet, record('unrelated'), savedOlderTweet], 'ads').map((r) => r.id), ['older-tweet', 'newer-tweet']);
+  const savedOlderTweet = { ...record('older-tweet'), postedAt: '2018-01-01T00:00:00Z', folderNames: ['Other', 'Ads'], folderSortIndices: ['1', '20'] };
+  const newerTweet = { ...record('newer-tweet'), postedAt: '2026-10-23T00:00:00Z', folderNames: ['Ads'], folderSortIndices: ['20'] };
+  assert.deepEqual(recentFolderBookmarks([newerTweet, record('unrelated'), savedOlderTweet], 'ads', ['older-tweet', 'newer-tweet']).map((r) => r.id), ['older-tweet', 'newer-tweet']);
 });
 
 test('focused conversations run before old backlog and include newly discovered folder bookmarks', async () => {
@@ -235,7 +235,10 @@ test('focused conversations run before old backlog and include newly discovered 
       timeline: async () => ({ added: 0, totalBookmarks: 1, pages: 1, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 1,
         stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' }),
       folders: async (options) => {
-        if (options?.onlyFolderName) { phases.push('focus'); write([...focused, record('old')]); }
+        if (options?.onlyFolderName) {
+          phases.push('focus'); write([...focused, record('old')]);
+          writeFileSync(path.join(directory, 'bookmark-folders-state.json'), JSON.stringify({ folders: [{ name: 'Ads', orderedRecordIds: ['a', 'b', 'c'] }] }));
+        }
         return emptyFolders;
       },
       conversation: async (options) => {
@@ -273,7 +276,11 @@ test('a conversation guardrail saves its pending ID and skips older enrichment',
     await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--focus-folder', 'Ads', '--comments', '1'], {
       timeline: async () => ({ added: 0, totalBookmarks: 1, pages: 1, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 1,
         stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' }),
-      folders: async () => { write([focused, record('old')]); return { folders: [], perFolder: [], targetFolderCount: 0, totalAdded: 1, totalTagged: 0, totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [] }; },
+      folders: async () => {
+        write([focused, record('old')]);
+        writeFileSync(path.join(directory, 'bookmark-folders-state.json'), JSON.stringify({ folders: [{ name: 'Ads', orderedRecordIds: ['ad'] }] }));
+        return { folders: [], perFolder: [], targetFolderCount: 0, totalAdded: 1, totalTagged: 0, totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [] };
+      },
       conversation: async () => { throw new HttpSafetyStopError('fixture stop', 'request budget reached'); },
       threads: async () => { throw new Error('must not run older threads after a conversation stop'); },
     });
