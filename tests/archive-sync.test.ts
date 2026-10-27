@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { acquireSyncLock, archiveSyncMain, availableRequestBudget, recentFolderBookmarks, renderBatchPreview } from '../src/archive-sync.js';
 import { HttpSafetyStopError } from '../src/http-safety.js';
+import { selectThreadBackfill, threadCoverageReport, threadCoverageLabel } from '../src/thread-coverage.js';
 import type { BookmarkRecord } from '../src/types.js';
 
 const now = Date.parse('2026-10-18T20:00:00Z');
@@ -83,7 +84,7 @@ test('archive command saves a budget pause and resumes enrichment for the origin
     const records = [record('new'), record('old')];
     const result = (added: number) => ({ added, addedIds: added ? ['new'] : [], totalBookmarks: 2, pages: 1,
       bookmarkedAtRepaired: 0, bookmarkedAtMissing: 2, stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' });
-    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--thread-backfill', '0'], {
       timeline: async () => { write(records); return result(1); },
       threads: async () => { throw new HttpSafetyStopError('fixture stop', 'request budget reached'); },
       gaps: async () => { throw new Error('Must not run gaps after a pause'); },
@@ -98,7 +99,7 @@ test('archive command saves a budget pause and resumes enrichment for the origin
     execFileSync('git', ['-C', directory, 'add', '-A']);
     execFileSync('git', ['-C', directory, 'commit', '-m', 'Save paused fixture']);
     process.exitCode = 0;
-    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--thread-backfill', '0'], {
       timeline: async () => result(0),
       threads: async (options) => {
         assert.deepEqual(options?.onlyTweetIds, ['new']); phases.push('threads');
@@ -142,7 +143,7 @@ test('archive command saves a budget pause and resumes enrichment for the origin
 test('a no-change sync does not accidentally enrich or download the full archive', async () => {
   await withArchive(async (directory) => {
     const unexpected = async (): Promise<never> => { throw new Error('Empty scopes must not mean the entire archive'); };
-    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--thread-backfill', '0'], {
       timeline: async () => ({ added: 0, addedIds: [], totalBookmarks: 1, pages: 1, bookmarkedAtRepaired: 0,
         bookmarkedAtMissing: 1, stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' }),
       threads: unexpected, gaps: unexpected, media: unexpected,
@@ -161,7 +162,7 @@ test('a page-limited timeline resumes its saved cursor rather than skipping to t
   await withArchive(async (directory, write) => {
     const result = { added: 1, addedIds: ['new'], totalBookmarks: 2, pages: 12,
       bookmarkedAtRepaired: 0, bookmarkedAtMissing: 2, stopReason: 'max pages reached', cachePath: '', statePath: '' };
-    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--thread-backfill', '0'], {
       timeline: async () => {
         write([record('new'), record('old')]);
         writeFileSync(path.join(directory, 'bookmarks-backfill-state.json'), JSON.stringify({ lastCursor: 'next-page' }));
@@ -173,7 +174,7 @@ test('a page-limited timeline resumes its saved cursor rather than skipping to t
     execFileSync('git', ['-C', directory, 'add', '-A']);
     execFileSync('git', ['-C', directory, 'commit', '-m', 'Save page boundary']);
     process.exitCode = 0;
-    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--thread-backfill', '0'], {
       timeline: async (options) => {
         assert.equal(options?.resumeCursor, 'next-page');
         return { ...result, added: 0, addedIds: [], pages: 1, stopReason: 'end of bookmarks' };
@@ -188,7 +189,7 @@ test('a large capture finishes media for ten bookmarks before expanding the next
   await withArchive(async (directory, write) => {
     const records = Array.from({ length: 14 }, (_, i) => ({ ...record(String(i)), folderIds: ['f'], folderNames: ['Research'] }));
     const calls: string[] = [];
-    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--thread-backfill', '0'], {
       timeline: async () => {
         write([...records, record('old')]);
         return { added: 14, addedIds: records.map((r) => r.id), totalBookmarks: 15, pages: 1,
@@ -231,7 +232,7 @@ test('focused conversations run before old backlog and include newly discovered 
     const focused = ['a', 'b', 'c'].map((id, i) => ({ ...record(id), folderIds: ['f'], folderNames: ['Ads'], folderSortIndices: [String(1000 - i)], engagement: { replyCount: [10, 90, 20][i] } }));
     const phases: string[] = [];
     const emptyFolders = { folders: [], perFolder: [], targetFolderCount: 0, totalAdded: 0, totalTagged: 0, totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [] };
-    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--focus-folder', 'Ads', '--comments', '2'], {
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--thread-backfill', '0', '--focus-folder', 'Ads', '--comments', '2'], {
       timeline: async () => ({ added: 0, totalBookmarks: 1, pages: 1, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 1,
         stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' }),
       folders: async (options) => {
@@ -273,7 +274,7 @@ test('focused conversations run before old backlog and include newly discovered 
 test('a conversation guardrail saves its pending ID and skips older enrichment', async () => {
   await withArchive(async (directory, write) => {
     const focused = { ...record('ad'), folderIds: ['f'], folderNames: ['Ads'], folderSortIndices: ['999'] };
-    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--focus-folder', 'Ads', '--comments', '1'], {
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--thread-backfill', '0', '--focus-folder', 'Ads', '--comments', '1'], {
       timeline: async () => ({ added: 0, totalBookmarks: 1, pages: 1, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 1,
         stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' }),
       folders: async () => {
@@ -286,6 +287,69 @@ test('a conversation guardrail saves its pending ID and skips older enrichment',
     });
     const state = JSON.parse(readFileSync(path.join(directory, 'logs/archive-sync-state.json'), 'utf8'));
     assert.deepEqual(state.pendingConversations, ['ad']);
+    assert.equal(process.exitCode, 2);
+  });
+});
+
+test('backfill prioritizes requested domains, bounds work, and distinguishes old checks from verified coverage', () => {
+  const legacy = { ...record('legacy'), folderNames: ['Paywalls'], threadExpandedAt: '2020-01-01T00:00:00Z' };
+  const complete: BookmarkRecord = { ...record('complete'), folderNames: ['Ads'], threadCapture: {
+    status: 'complete', checkedAt: '', retryable: false, parentsComplete: true, detailComplete: true, pagesFetched: 1 } };
+  const partial: BookmarkRecord = { ...record('partial'), threadCapture: {
+    status: 'partial', checkedAt: '', retryable: true, parentsComplete: true, detailComplete: false, pagesFetched: 3, nextCursor: 'next' } };
+  const rows = [record('other'), legacy, complete, partial, { ...record('consumer'), folderNames: ['Consumer Apps'] }];
+  assert.deepEqual(selectThreadBackfill(rows, new Set(), 2), ['legacy', 'consumer']);
+  assert.deepEqual(selectThreadBackfill(rows, new Set(['legacy']), 1), ['consumer']);
+  assert.deepEqual(selectThreadBackfill(rows, new Set(), 0), []);
+  const coverage = threadCoverageReport(rows);
+  assert.equal(coverage.complete, 1);
+  assert.equal(coverage.legacyUnverified, 1);
+  assert.equal(coverage.partial, 1);
+  assert.equal(coverage.unchecked, 2);
+  assert.equal(coverage.resumable, 1);
+  assert.match(threadCoverageLabel(legacy), /not verified/);
+  assert.match(threadCoverageLabel(partial), /Incomplete/);
+});
+
+test('default backfill is bounded, new bookmarks go first, and partial threads remain queued', async () => {
+  await withArchive(async (directory, write) => {
+    const old = Array.from({ length: 12 }, (_, i) => ({ ...record(`old-${i}`), folderNames: ['Ads'] }));
+    write(old);
+    execFileSync('git', ['-C', directory, 'add', '-A']);
+    execFileSync('git', ['-C', directory, 'commit', '-m', 'Historical fixtures']);
+    const current = [{ ...record('new'), folderNames: ['Ads'] }, ...old];
+    const checked: string[] = [];
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+      timeline: async () => {
+        write(current);
+        return { added: 1, totalBookmarks: 13, pages: 1, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 13,
+          stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' };
+      },
+      threads: async (options) => {
+        const ids = options!.onlyTweetIds!;
+        checked.push(...ids);
+        for (const bookmark of current.filter((r) => ids.includes(r.id))) {
+          bookmark.threadCapture = { status: bookmark.id === 'new' ? 'partial' : 'complete', checkedAt: '',
+            retryable: bookmark.id === 'new', parentsComplete: true, detailComplete: bookmark.id !== 'new', pagesFetched: 3,
+            nextCursor: bookmark.id === 'new' ? 'resume' : undefined };
+        }
+        write(current);
+        return { total: ids.length, contextFilled: 0, belowFilled: 0, emptyChecked: 0, failed: 0, failures: [],
+          completedIds: ids.filter((id) => id !== 'new'), pendingIds: ids.filter((id) => id === 'new') };
+      },
+      gaps: async () => ({ total: 0, quotedTweetsFilled: 0, textExpanded: 0, articlesEnriched: 0, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 0, failed: 0, failures: [] }),
+      media: async () => ({ schemaVersion: 1, generatedAt: '', limit: 0, maxBytes: 10, processed: 0, downloaded: 0, failed: 0, skippedTooLarge: 0, entries: [] }),
+      folders: async () => ({ folders: [], perFolder: [], targetFolderCount: 0, totalAdded: 0, totalTagged: 0, totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [] }),
+    });
+    assert.equal(checked[0], 'new');
+    assert.equal(checked.length, 11);
+    assert.equal(new Set(checked).size, 11);
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    assert.deepEqual(summary.pending.threads, ['new']);
+    assert.equal(summary.threadBackfillIds.length, 10);
+    assert.equal(summary.threadCoverage.complete, 10);
+    assert.equal(summary.threadCoverage.partial, 1);
+    assert.equal(summary.threadCoverage.unchecked, 2);
     assert.equal(process.exitCode, 2);
   });
 });

@@ -36,6 +36,7 @@ import {
 } from '../src/graphql-bookmarks.js';
 import { buildIndex, getBookmarkById, searchBookmarks } from '../src/bookmarks-db.js';
 import { resolveFolder, formatFolderMirrorStats } from '../src/cli.js';
+import { HttpSafetyStopError } from '../src/http-safety.js';
 import type { BookmarkFolder, BookmarkRecord } from '../src/types.js';
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -1255,6 +1256,154 @@ async function withIsolatedGapFillDataDir(
   }
 }
 
+function threadPage(tweets: Array<[string, string?]>, cursor?: string) {
+  const entries: any[] = tweets.map(([id, parent]) => ({ entryId: `tweet-${id}`, content: { itemContent: {
+    tweet_results: { result: makeTweetResult({ tweet: { rest_id: id }, legacy: {
+      id_str: id, full_text: `Post ${id}`, in_reply_to_status_id_str: parent,
+    } }) },
+  } } }));
+  if (cursor) entries.push({ entryId: 'cursor-bottom-0', content: { value: cursor } });
+  return { data: { threaded_conversation_with_injections_v2: { instructions: [{ type: 'TimelineAddEntries', entries }] } } };
+}
+
+test('syncThreads: resumes beyond three pages and connects same-author posts split across pages', async () => {
+  await withIsolatedGapFillDataDir(async () => {
+    const originalFetch = globalThis.fetch;
+    const cursors: Array<string | undefined> = [];
+    const pages: Record<string, unknown> = {
+      head: threadPage([['100'], ['102', '101']], 'a'),
+      a: threadPage([['101', '100']], 'b'),
+      b: threadPage([['103', '102']], 'c'),
+      c: threadPage([['104', '103']]),
+    };
+    const read = async () => JSON.parse((await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8')).trim());
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const cursor = JSON.parse(new URL(String(input)).searchParams.get('variables')!).cursor;
+      cursors.push(cursor);
+      assert.ok(pages[cursor ?? 'head']);
+      return new Response(JSON.stringify(pages[cursor ?? 'head']));
+    }) as typeof fetch;
+    try {
+      const first = await syncThreads({ csrfToken: 'ct0', delayMs: 0 });
+      assert.deepEqual(first.pendingIds, ['100']);
+      let stored = await read();
+      assert.equal(stored.threadCapture.status, 'partial');
+      assert.equal(stored.threadCapture.nextCursor, 'c');
+      assert.equal(stored.threadExpandedAt, undefined);
+      assert.deepEqual(stored.threadBelow.map((t: any) => t.id), ['101', '102', '103']);
+      const second = await syncThreads({ csrfToken: 'ct0', delayMs: 0 });
+      stored = await read();
+      assert.deepEqual(cursors, [undefined, 'a', 'b', 'c']);
+      assert.deepEqual(second.completedIds, ['100']);
+      assert.deepEqual(second.pendingIds, []);
+      assert.equal(stored.threadCapture.status, 'complete');
+      assert.equal(stored.threadCapture.pagesFetched, 4);
+      assert.equal(stored.threadCapture.detailTweets, undefined);
+      assert.deepEqual(stored.threadBelow.map((t: any) => t.id), ['101', '102', '103', '104']);
+      assert.ok(stored.threadExpandedAt);
+    } finally { globalThis.fetch = originalFetch; }
+  }, [makeRecord({ id: '100', tweetId: '100', authorHandle: 'testuser' })]);
+});
+
+test('syncThreads: a guardrail between pages checkpoints the next cursor and fetched posts', async () => {
+  await withIsolatedGapFillDataDir(async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      if (++calls === 2) throw new HttpSafetyStopError('fixture', 'request budget reached');
+      return new Response(JSON.stringify(threadPage([['100'], ['101', '100']], 'resume-here')));
+    }) as typeof fetch;
+    try {
+      await assert.rejects(() => syncThreads({ csrfToken: 'ct0', delayMs: 0 }), /fixture/);
+      const stored = JSON.parse((await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8')).trim());
+      assert.equal(stored.threadCapture.nextCursor, 'resume-here');
+      assert.equal(stored.threadCapture.status, 'partial');
+      assert.equal(stored.threadCapture.retryable, true);
+      assert.equal(stored.threadBelow[0].id, '101');
+      assert.equal(stored.threadExpandedAt, undefined);
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        assert.equal(JSON.parse(new URL(String(input)).searchParams.get('variables')!).cursor, 'resume-here');
+        return new Response(JSON.stringify(threadPage([['102', '101']])));
+      }) as typeof fetch;
+      const result = await syncThreads({ csrfToken: 'ct0', delayMs: 0 });
+      assert.deepEqual(result.completedIds, ['100']);
+    } finally { globalThis.fetch = originalFetch; }
+  }, [makeRecord({ id: '100', tweetId: '100', authorHandle: 'testuser' })]);
+});
+
+test('syncThreads: cursor cycles remain explicitly incomplete without an automatic retry loop', async () => {
+  await withIsolatedGapFillDataDir(async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => new Response(JSON.stringify(threadPage([['100']], ++calls === 1 ? 'a' : 'a')))) as typeof fetch;
+    try {
+      await syncThreads({ csrfToken: 'ct0', delayMs: 0 });
+      const stored = JSON.parse((await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8')).trim());
+      assert.equal(calls, 2);
+      assert.equal(stored.threadCapture.status, 'partial');
+      assert.equal(stored.threadCapture.reason, 'repeated_cursor');
+      assert.equal(stored.threadCapture.retryable, false);
+      assert.equal((await syncThreads({ csrfToken: 'ct0', delayMs: 0 })).total, 0);
+    } finally { globalThis.fetch = originalFetch; }
+  }, [makeRecord({ id: '100', tweetId: '100', authorHandle: 'testuser' })]);
+});
+
+test('syncThreads: resumes a parent chain beyond the per-run parent cap without repeating detail pages', async () => {
+  await withIsolatedGapFillDataDir(async () => {
+    const originalFetch = globalThis.fetch;
+    let detailCalls = 0;
+    const parents: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.includes('TweetDetail')) {
+        detailCalls++;
+        return new Response(JSON.stringify(threadPage([['100']])));
+      }
+      const id = JSON.parse(url.searchParams.get('variables')!).tweetId;
+      parents.push(id);
+      return new Response(JSON.stringify({ data: { tweetResult: { result: makeTweetResult({ tweet: { rest_id: id }, legacy: {
+        id_str: id, in_reply_to_status_id_str: Number(id) > 74 ? String(Number(id) - 1) : undefined,
+      } }) } } }));
+    }) as typeof fetch;
+    try {
+      assert.deepEqual((await syncThreads({ csrfToken: 'ct0', delayMs: 0 })).pendingIds, ['100']);
+      assert.deepEqual((await syncThreads({ csrfToken: 'ct0', delayMs: 0 })).completedIds, ['100']);
+      const stored = JSON.parse((await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8')).trim());
+      assert.equal(parents.length, 26);
+      assert.equal(new Set(parents).size, 26);
+      assert.equal(detailCalls, 1);
+      assert.equal(stored.threadContext.length, 26);
+      assert.equal(stored.threadCapture.status, 'complete');
+    } finally { globalThis.fetch = originalFetch; }
+  }, [makeRecord({ id: '100', tweetId: '100', authorHandle: 'testuser', inReplyToStatusId: '99' })]);
+});
+
+test('syncThreads: unavailable parents do not turn into a completed capture', async () => {
+  await withIsolatedGapFillDataDir(async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => new Response(JSON.stringify(String(input).includes('TweetDetail')
+      ? threadPage([['100']]) : { data: { tweetResult: { result: { __typename: 'TweetUnavailable' } } } }))) as typeof fetch;
+    try {
+      await syncThreads({ csrfToken: 'ct0', delayMs: 0 });
+      const stored = JSON.parse((await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8')).trim());
+      assert.equal(stored.threadCapture.status, 'partial');
+      assert.equal(stored.threadCapture.reason, 'parent_not_found');
+      assert.equal(stored.threadCapture.retryable, false);
+      assert.equal(stored.threadExpandedAt, undefined);
+    } finally { globalThis.fetch = originalFetch; }
+  }, [makeRecord({ id: '100', tweetId: '100', authorHandle: 'testuser', inReplyToStatusId: '99' })]);
+});
+
+test('syncThreads: verifies legacy checks instead of treating an old timestamp as pagination proof', async () => {
+  await withIsolatedGapFillDataDir(async () => {
+    let calls = 0;
+    await syncThreads({ delayMs: 0, threadFetcher: async () => {
+      calls++; return { context: [], below: [], status: 'ok' };
+    } });
+    assert.equal(calls, 1);
+  }, [makeRecord({ id: '100', tweetId: '100', threadExpandedAt: '2020-01-01T00:00:00Z', threadContext: [], threadBelow: [] })]);
+});
+
 test('syncThreads: writes parent context and same-author continuations to JSONL and DB', async () => {
   const bookmark = makeRecord({
     id: '100',
@@ -1384,7 +1533,7 @@ test('syncThreads: empty TweetDetail preserves fetched parent context as a compl
   }, [bookmark]);
 });
 
-test('syncThreads: rechecks recent empty threads but skips old checked empties', async () => {
+test('syncThreads: rechecks recent completed threads but skips old verified completions', async () => {
   const recentChecked = makeRecord({
     id: '200',
     tweetId: '200',
@@ -1395,6 +1544,7 @@ test('syncThreads: rechecks recent empty threads but skips old checked empties',
     threadContext: [],
     threadBelow: [],
     threadExpandedAt: new Date(Date.now() - 7 * 60 * 60_000).toISOString(),
+    threadCapture: { status: 'complete', checkedAt: NOW, retryable: false, parentsComplete: true, detailComplete: true, pagesFetched: 1 },
   });
   const oldChecked = makeRecord({
     id: '300',
@@ -1406,6 +1556,7 @@ test('syncThreads: rechecks recent empty threads but skips old checked empties',
     threadContext: [],
     threadBelow: [],
     threadExpandedAt: '2026-01-01T02:00:00.000Z',
+    threadCapture: { status: 'complete', checkedAt: NOW, retryable: false, parentsComplete: true, detailComplete: true, pagesFetched: 1 },
   });
 
   await withIsolatedGapFillDataDir(async () => {

@@ -13,6 +13,7 @@ import { exportReadableBookmarkArchive } from './bookmark-folder-export.js';
 import { buildIndex } from './bookmarks-db.js';
 import { exportTweetConversationMarkdown } from './tweet-conversation-export.js';
 import type { BookmarkRecord, ThreadTweetSnapshot } from './types.js';
+import { selectThreadBackfill, threadCoverageLabel, threadCoverageReport } from './thread-coverage.js';
 
 type Stage = 'threads' | 'gaps' | 'media' | 'folders';
 type Pending = Record<Stage, string[]>;
@@ -132,7 +133,7 @@ export function renderBatchPreview(records: BookmarkRecord[], entries: MediaFetc
       ? `<section><h3>${escapeHtml(tweet.articleTitle ?? 'Article')}</h3><div class="body">${escapeHtml(tweet.articleText)}</div></section>` : '';
     return `<section class="tweet"><h2>@${escapeHtml(tweet.authorHandle)}</h2><a href="https://x.com/i/status/${escapeHtml(tweetId)}">${escapeHtml(tweetId)}</a><div class="body">${escapeHtml(tweet.text)}</div>${article}${links ? `<ul>${links}</ul>` : ''}<div class="media">${assets}</div></section>`;
   };
-  const body = records.map((record) => `<article><p>${escapeHtml(record.folderNames?.join(' / ') ?? '')}</p>
+  const body = records.map((record) => `<article><p>${escapeHtml(record.folderNames?.join(' / ') ?? '')}</p><p>${escapeHtml(threadCoverageLabel(record))}</p>
     ${(record.threadContext ?? []).map((tweet) => render(tweet, record.id)).join('')}
     ${render(record, record.id)}
     ${record.quotedTweet ? `<blockquote>${render(record.quotedTweet, record.id)}</blockquote>` : ''}
@@ -158,6 +159,10 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     .option('--hourly-budget <n>', 'Maximum requests including recent saved audit logs', positive, 300)
     .option('--recent-folders <n>', 'Maximum folders to reconcile in X order', positive, 20)
     .option('--focus-folder <name>', 'Sync and prioritize this folder before the older enrichment backlog')
+    .option('--thread-backfill <n>', 'Maximum historical thread checks added per run (0 disables), prioritizing Ads, Paywalls and Consumer Apps', (value: string) => {
+      if (value === '0') return 0;
+      return positive(value);
+    }, 10)
     .option('--comments <n>', 'Capture N conversations from the ten latest focused bookmarks, prioritizing reply activity', positive, 0)
     .option('--comment-pages <n>', 'Maximum root conversation pages per focused bookmark', positive, 6)
     .option('--comment-branches <n>', 'Maximum reply branches expanded per focused bookmark', positive, 6)
@@ -191,6 +196,8 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       git(directory, 'merge', '--ff-only', `origin/${branch}`);
     }
     const initial = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
+    const initialMedia = new Set(jsonFile<{ entries: MediaFetchEntry[] }>(path.join(directory, 'media-manifest.json'), { entries: [] })
+      .entries.filter((entry) => entry.status === 'downloaded').map((entry) => entry.localPath));
     const beforeIds = new Set(initial.map((record) => record.id));
     const statePath = path.join(logs, 'archive-sync-state.json');
     const saved = jsonFile<SyncState>(statePath, {});
@@ -251,6 +258,10 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const focusedSnapshot = options.focusFolder ? folderState.folders.find((folder) => folder.name.toLowerCase() === options.focusFolder.toLowerCase()) : undefined;
     if (options.focusFolder && !focusedSnapshot?.orderedRecordIds && !paused) paused = 'Focused folder has no ordered snapshot';
     const focused = options.focusFolder ? recentFolderBookmarks(captured, options.focusFolder, focusedSnapshot?.orderedRecordIds ?? []) : [];
+    const resumableIds = captured.filter((record) => record.threadCapture?.retryable).map((record) => record.id);
+    const backfillIds = selectThreadBackfill(captured, new Set([...pending.threads, ...focused.map((record) => record.id)]), options.threadBackfill);
+    pending.threads = [...new Set([...pending.threads, ...resumableIds, ...backfillIds])];
+    const priorityIds = [...new Set([...focused.map((record) => record.id), ...newIds, ...resumableIds])];
     const conversationTargets = options.comments ? [...focused].sort((a, b) =>
       (b.engagement?.replyCount ?? 0) - (a.engagement?.replyCount ?? 0)).slice(0, options.comments) : [];
     pendingConversations = [...new Set([...pendingConversations, ...conversationTargets.map((record) => record.tweetId)])];
@@ -286,8 +297,9 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     let chunk = 0;
     const enrich = async (): Promise<void> => {
       while (!paused) {
-        // Finish earlier captures before moving into new thread work.
-        const ids = [...new Set([...pending.media, ...pending.gaps, ...pending.threads])].filter((id) => !attempted.has(id)).slice(0, 10);
+        const queued = new Set([...pending.threads, ...pending.gaps, ...pending.media]);
+        const ids = [...new Set([...priorityIds.filter((id) => queued.has(id)), ...pending.media, ...pending.gaps, ...pending.threads])]
+          .filter((id) => !attempted.has(id)).slice(0, 10);
         if (!ids.length) break;
         ids.forEach((id) => attempted.add(id));
         chunk++;
@@ -296,7 +308,12 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         if (threadIds.length) {
           const threads = await run(`threads-${chunk}`, () => services.threads({ ...auth, onlyTweetIds: threadIds, delayMs: 5000,
             onProgress: (p) => console.log(`[threads] ${p.done}/${p.total}, ${p.belowFilled} continuation chains`) }));
-          if (threads) completeStage('threads', threadIds);
+          if (threads) {
+            completeStage('threads', threads.completedIds ?? threadIds);
+            // Newly discovered continuation assets and articles need their own downstream pass.
+            for (const stage of ['gaps', 'media'] as Stage[]) pending[stage] = [...new Set([...pending[stage], ...threadIds])];
+            persistState();
+          }
         }
         const gapIds = selected('gaps');
         if (gapIds.length) {
@@ -335,12 +352,14 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       await enrich();
     }
     const finalRecords = folderOnlyIds.length ? await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath()) : records;
-    const batchIds = new Set([...newIds, ...folderOnlyIds, ...focused.map((record) => record.id), ...Object.values(saved.pending ?? {}).flat()]);
+    const batchIds = new Set([...newIds, ...folderOnlyIds, ...focused.map((record) => record.id), ...backfillIds, ...resumableIds, ...Object.values(saved.pending ?? {}).flat()]);
     const batch = finalRecords.filter((record) => batchIds.has(record.id));
     await buildIndex({ force: true });
     const exported = await exportReadableBookmarkArchive({ clean: true, includeUnfiled: false });
     const manifest = jsonFile<{ entries: MediaFetchEntry[] }>(path.join(directory, 'media-manifest.json'), { entries: [] });
     const batchMedia = manifest.entries.filter((entry) => batchIds.has(entry.bookmarkId));
+    const addedMedia = [...new Map(manifest.entries.filter((entry) => entry.status === 'downloaded' && entry.localPath && !initialMedia.has(entry.localPath))
+      .map((entry) => [entry.localPath, entry])).values()];
     const previewPath = path.join(previewDir, 'latest-batch.html');
     writeFileSync(previewPath, renderBatchPreview(batch, batchMedia, directory));
     const requests = freshAudit();
@@ -354,7 +373,10 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       pending, pendingConversations, conversations, focusFolder: options.focusFolder,
       conversationTargets: conversationTargets.map((record) => ({ tweetId: record.tweetId, url: record.url,
         authorHandle: record.authorHandle, text: record.text.slice(0, 240), reportedReplies: record.engagement?.replyCount })),
-      timelineCursor, stages, exported, previewPath,
+      timelineCursor, stages, exported, previewPath, threadCoverage: threadCoverageReport(finalRecords), batchThreadCoverage: threadCoverageReport(batch), threadBackfillIds: backfillIds,
+      newBookmarkIds: finalRecords.filter((record) => !beforeIds.has(record.id)).map((record) => record.id),
+      articlesAdded: finalRecords.filter((record) => record.articleText && !initial.find((old) => old.id === record.id)?.articleText).length,
+      mediaAdded: { downloaded: addedMedia.length, videos: addedMedia.filter((entry) => entry.contentType?.startsWith('video/')).length },
       media: { downloaded: batchMedia.filter((entry) => entry.status === 'downloaded').length,
         videos: batchMedia.filter((entry) => entry.status === 'downloaded' && entry.contentType?.startsWith('video/')).length,
         skippedTooLarge: batchMedia.filter((entry) => entry.status === 'skipped_too_large').length,

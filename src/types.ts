@@ -118,6 +118,23 @@ export interface ThreadTweetSnapshot extends TweetArticleSnapshot {
   url: string;
 }
 
+export interface ThreadCaptureState {
+  /** Complete means the returned timeline and parent chain were exhausted, not that X exposed every post. */
+  status: 'complete' | 'partial' | 'unavailable';
+  checkedAt: string;
+  retryable: boolean;
+  parentsComplete: boolean;
+  detailComplete: boolean;
+  pagesFetched: number;
+  nextParentId?: string;
+  nextCursor?: string;
+  reason?: string;
+  /** Intermediate same-author snapshots retain links across page boundaries. */
+  detailTweets?: ThreadTweetSnapshot[];
+  parentIds?: string[];
+  seenCursors?: string[];
+}
+
 export interface BookmarkRecord {
   id: string;
   tweetId: string;
@@ -191,6 +208,8 @@ export interface BookmarkRecord {
    * completed check, but recent tweets are rechecked for delayed self-replies.
    */
   threadExpandedAt?: string;
+  /** Durable pagination checkpoint and explicit API-visible coverage. Legacy checks have no coverage proof. */
+  threadCapture?: ThreadCaptureState;
   /**
    * Set when thread expansion hit a permanent failure for the focal tweet,
    * preventing repeated fetches for deleted or unavailable tweets.

@@ -19,6 +19,7 @@ import { parseTimestampMs, toIsoDate } from './date-utils.js';
 import { slug } from './md.js';
 import type { BookmarkMediaObject, BookmarkRecord, QuotedTweetSnapshot, ThreadTweetSnapshot } from './types.js';
 import type { MediaFetchEntry, MediaFetchManifest } from './bookmark-media.js';
+import { threadCoverageLabel } from './thread-coverage.js';
 
 interface FolderStateEntry {
   id: string;
@@ -366,6 +367,7 @@ function renderBookmarkMarkdown(
   if (record.postedAt) lines.push(`- Posted: ${record.postedAt}`);
   if (record.bookmarkedAt) lines.push(`- Bookmarked: ${record.bookmarkedAt}`);
   lines.push(`- Synced: ${record.syncedAt}`);
+  lines.push(`- Thread coverage: ${threadCoverageLabel(record)}`);
   if (record.sortIndex) lines.push(`- Sort index: ${record.sortIndex}`);
   if (record.language) lines.push(`- Language: ${record.language}`);
   if (record.engagement?.likeCount != null) lines.push(`- Likes: ${record.engagement.likeCount}`);

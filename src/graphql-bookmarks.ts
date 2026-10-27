@@ -13,6 +13,7 @@ import type {
   BookmarkMediaObject,
   BookmarkRecord,
   QuotedTweetSnapshot,
+  ThreadCaptureState,
   ThreadTweetSnapshot,
 } from './types.js';
 import { exportBookmarksForSyncSeed, updateQuotedTweets, updateBookmarkText, updateArticleContent, updateThreadData } from './bookmarks-db.js';
@@ -2303,12 +2304,20 @@ export async function fetchTweetDetailViaGraphQL(
   tweetId: string,
   csrfToken: string,
   cookieHeader?: string,
-  options: { maxPages?: number; delayMs?: number } = {},
-): Promise<{ tweets: ThreadTweetSnapshot[]; status: TweetFetchResult['status']; httpStatus?: number }> {
+  options: { maxPages?: number; delayMs?: number; cursor?: string; seenCursors?: string[];
+    onPage?: (page: { tweets: ThreadTweetSnapshot[]; nextCursor?: string; complete: boolean;
+      repeatedCursor: boolean; requestedCursor?: string }) => Promise<void> } = {},
+): Promise<{ tweets: ThreadTweetSnapshot[]; status: TweetFetchResult['status']; httpStatus?: number;
+  nextCursor?: string; pagesFetched: number; stopReason: 'end' | 'page_limit' | 'repeated_cursor' | 'error' }> {
   const maxPages = options.maxPages ?? 3;
   const delayMs = options.delayMs ?? 300;
   const tweets: ThreadTweetSnapshot[] = [];
-  let cursor: string | undefined;
+  let cursor = options.cursor;
+  const seenCursors = new Set(options.seenCursors ?? []);
+  let pagesFetched = 0;
+  let stopReason: 'end' | 'page_limit' | 'repeated_cursor' | 'error' = 'page_limit';
+  const failure = (status: TweetFetchResult['status'], httpStatus?: number) =>
+    ({ tweets, status, httpStatus, nextCursor: cursor, pagesFetched, stopReason: 'error' as const });
   let sawRecognizedTimeline = false;
   let sawTweetResult = false;
   let sawUnavailableTweet = false;
@@ -2327,14 +2336,14 @@ export async function fetchTweetDetailViaGraphQL(
       });
     } catch (error) {
       if (isHttpSafetyStop(error)) throw error;
-      return { tweets, status: 'error' };
+      return failure('error');
     }
 
-    if (response.status === 429) return { tweets, status: 'rate_limited', httpStatus: 429 };
-    if (response.status === 404) return { tweets, status: 'not_found', httpStatus: 404 };
-    if (response.status === 401 || response.status === 403) return { tweets, status: 'error', httpStatus: response.status };
-    if (response.status >= 500) return { tweets, status: 'server_error', httpStatus: response.status };
-    if (!response.ok) return { tweets, status: 'error', httpStatus: response.status };
+    if (response.status === 429) return failure('rate_limited', 429);
+    if (response.status === 404) return failure('not_found', 404);
+    if (response.status === 401 || response.status === 403) return failure('error', response.status);
+    if (response.status >= 500) return failure('server_error', response.status);
+    if (!response.ok) return failure('error', response.status);
 
     const json = await response.json();
     const parsed = parseTweetDetailResponse(json);
@@ -2343,8 +2352,18 @@ export async function fetchTweetDetailViaGraphQL(
     sawUnavailableTweet = sawUnavailableTweet || parsed.sawUnavailableTweet;
     sawUnparseableTweet = sawUnparseableTweet || parsed.sawUnparseableTweet;
     tweets.push(...parsed.tweets);
-    if (!parsed.nextCursor || parsed.nextCursor === cursor) break;
+    if (!parsed.recognizedTimeline || parsed.sawUnparseableTweet) return failure('error');
+    const requestedCursor = cursor;
+    if (cursor) seenCursors.add(cursor);
+    const repeatedCursor = Boolean(parsed.nextCursor && seenCursors.has(parsed.nextCursor));
+    const complete = !parsed.nextCursor;
     cursor = parsed.nextCursor;
+    pagesFetched++;
+    await options.onPage?.({ tweets: parsed.tweets, nextCursor: cursor, complete, repeatedCursor, requestedCursor });
+    if (complete || repeatedCursor) {
+      stopReason = complete ? 'end' : 'repeated_cursor';
+      break;
+    }
     if (page < maxPages - 1) await new Promise((r) => setTimeout(r, delayMs));
   }
 
@@ -2353,11 +2372,11 @@ export async function fetchTweetDetailViaGraphQL(
     if (!byId.has(tweet.id)) byId.set(tweet.id, tweet);
   }
   if (byId.size === 0) {
-    if (sawUnavailableTweet && !sawUnparseableTweet) return { tweets: [], status: 'not_found' };
-    if (sawRecognizedTimeline && !sawTweetResult) return { tweets: [], status: 'empty' };
-    return { tweets: [], status: 'error' };
+    if (sawUnavailableTweet && !sawUnparseableTweet) return failure('not_found');
+    if (sawRecognizedTimeline && !sawTweetResult) return { tweets: [], status: 'empty', nextCursor: cursor, pagesFetched, stopReason };
+    return failure('error');
   }
-  return { tweets: Array.from(byId.values()).sort(compareThreadTweetsChronologically), status: 'ok' };
+  return { tweets: Array.from(byId.values()).sort(compareThreadTweetsChronologically), status: 'ok', nextCursor: cursor, pagesFetched, stopReason };
 }
 
 function parseSyndicationThreadTweet(data: any, tweetId: string): ThreadTweetSnapshot | null {
@@ -2481,12 +2500,15 @@ export interface ThreadSyncResult {
   failed: number;
   failures: ThreadSyncFailure[];
   total: number;
+  completedIds?: string[];
+  pendingIds?: string[];
 }
 
 type ThreadExpansionFetcher = (record: BookmarkRecord) => Promise<{
   context: ThreadTweetSnapshot[];
   below: ThreadTweetSnapshot[];
   status: TweetFetchResult['status'];
+  capture?: ThreadCaptureState;
 }>;
 
 const THREAD_TRANSIENT_FAILURE_STATUSES = new Set<TweetFetchResult['status']>([
@@ -2519,6 +2541,10 @@ export interface SyncThreadsOptions {
 
 function shouldSyncThread(record: BookmarkRecord, nowMs: number): boolean {
   if (record.threadExpansionFailedAt) return false;
+  if (record.threadCapture?.status === 'partial') return record.threadCapture.retryable;
+  if (record.threadCapture?.status === 'unavailable') return false;
+  // Old checks did not preserve pagination exhaustion, so they need verification.
+  if (!record.threadCapture) return true;
   if (record.threadContext === undefined || record.threadBelow === undefined) return true;
   if (!record.threadExpandedAt) return true;
 
@@ -2589,32 +2615,84 @@ async function expandThreadForRecord(
   record: BookmarkRecord,
   cookies: { csrfToken?: string; cookieHeader?: string },
   delayMs: number,
-): Promise<{ context: ThreadTweetSnapshot[]; below: ThreadTweetSnapshot[]; status: TweetFetchResult['status'] }> {
-  const context: ThreadTweetSnapshot[] = [];
-  let nextParentId = record.inReplyToStatusId;
-  const seenParents = new Set<string>();
-
-  while (nextParentId && !seenParents.has(nextParentId) && context.length < 25) {
-    seenParents.add(nextParentId);
-    const parent = await fetchThreadTweetById(nextParentId, cookies);
-    if (!parent.tweet) {
-      if (parent.status === 'not_found' || parent.status === 'forbidden' || parent.status === 'empty') break;
-      return { context, below: [], status: parent.status };
+  checkpoint: () => Promise<void>,
+): ReturnType<ThreadExpansionFetcher> {
+  const resume = record.threadCapture?.status === 'partial' && record.threadCapture.retryable;
+  const capture: ThreadCaptureState = resume ? { ...record.threadCapture! } : {
+    status: 'partial', checkedAt: new Date().toISOString(), retryable: true,
+    parentsComplete: !record.inReplyToStatusId, detailComplete: false, pagesFetched: 0,
+    nextParentId: record.inReplyToStatusId, detailTweets: [], parentIds: [], seenCursors: [],
+  };
+  const context = [...(record.threadContext ?? [])];
+  const mergeTweets = (old: ThreadTweetSnapshot[], added: ThreadTweetSnapshot[]) =>
+    [...new Map([...old, ...added].map((tweet) => [tweet.id, tweet])).values()].sort(compareThreadTweetsChronologically);
+  let below = [...(record.threadBelow ?? [])];
+  const save = async (): Promise<void> => {
+    capture.checkedAt = new Date().toISOString();
+    record.threadCapture = capture;
+    record.threadContext = context;
+    record.threadBelow = below;
+    await checkpoint();
+  };
+  const result = (status: TweetFetchResult['status']) => ({ context, below, status, capture });
+  await save();
+  const seenParents = new Set(capture.parentIds ?? []);
+  for (let count = 0; capture.nextParentId && count < 25; count++) {
+    const parentId = capture.nextParentId;
+    if (seenParents.has(parentId)) {
+      capture.reason = 'parent_cycle';
+      delete capture.nextParentId;
+      break;
     }
-    context.unshift(parent.tweet);
-    nextParentId = parent.tweet.inReplyToStatusId;
-    if (nextParentId) await new Promise((r) => setTimeout(r, delayMs));
+    const parent = await fetchThreadTweetById(parentId, cookies);
+    if (!parent.tweet) {
+      if (!isPermanentThreadFailure(parent.status)) return result(parent.status);
+      capture.reason = `parent_${parent.status}`;
+      delete capture.nextParentId;
+      break;
+    }
+    seenParents.add(parentId);
+    capture.parentIds = [...seenParents];
+    const updatedContext = mergeTweets(context, [parent.tweet]);
+    context.splice(0, context.length, ...updatedContext);
+    capture.nextParentId = parent.tweet.inReplyToStatusId;
+    capture.parentsComplete = !capture.nextParentId;
+    await save();
+    if (capture.nextParentId) await new Promise((r) => setTimeout(r, delayMs));
   }
 
-  let below: ThreadTweetSnapshot[] = [];
-  if (cookies.csrfToken) {
-    const detail = await fetchTweetDetailViaGraphQL(record.tweetId, cookies.csrfToken, cookies.cookieHeader, { delayMs });
-    if (detail.status === 'empty') return { context, below: [], status: 'ok' };
-    if (detail.status !== 'ok') return { context, below: [], status: detail.status };
-    below = extractSameAuthorThreadBelow(detail.tweets, record.tweetId, record.authorHandle);
+  if (!capture.detailComplete && cookies.csrfToken) {
+    const detail = await fetchTweetDetailViaGraphQL(record.tweetId, cookies.csrfToken, cookies.cookieHeader, {
+      delayMs, cursor: capture.nextCursor, seenCursors: capture.seenCursors,
+      onPage: async (page) => {
+        if (page.requestedCursor) capture.seenCursors = [...new Set([...(capture.seenCursors ?? []), page.requestedCursor])];
+        const focal = page.tweets.find((tweet) => tweet.id === record.tweetId);
+        if (!record.authorHandle && focal?.authorHandle) record.authorHandle = focal.authorHandle;
+        const sameAuthor = page.tweets.filter((tweet) => tweet.authorHandle?.toLowerCase() === record.authorHandle?.toLowerCase());
+        capture.detailTweets = mergeTweets(capture.detailTweets ?? [], sameAuthor);
+        below = mergeTweets(below, extractSameAuthorThreadBelow(capture.detailTweets, record.tweetId, record.authorHandle));
+        capture.pagesFetched++;
+        capture.nextCursor = page.nextCursor;
+        capture.detailComplete = page.complete;
+        if (page.repeatedCursor) capture.reason = 'repeated_cursor';
+        await save();
+      },
+    });
+    if (detail.status !== 'ok' && detail.status !== 'empty') return result(detail.status);
   }
-
-  return { context, below, status: 'ok' };
+  const complete = capture.parentsComplete && capture.detailComplete && Boolean(record.authorHandle);
+  capture.status = complete ? 'complete' : 'partial';
+  capture.retryable = !complete && Boolean(capture.nextParentId || (capture.nextCursor && capture.reason !== 'repeated_cursor'));
+  if (complete) {
+    delete capture.reason;
+    delete capture.detailTweets;
+    delete capture.parentIds;
+    delete capture.seenCursors;
+  } else if (!capture.reason) {
+    capture.reason = !record.authorHandle ? 'missing_author' : capture.nextParentId ? 'parent_batch_limit' : 'page_limit';
+  }
+  await save();
+  return result('ok');
 }
 
 export async function syncThreads(options: SyncThreadsOptions = {}): Promise<ThreadSyncResult> {
@@ -2643,6 +2721,8 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
       failed: 0,
       failures: [],
       total: 0,
+      completedIds: scopedRecords.filter((record) => !shouldSyncThread(record, nowMs)).map((record) => record.id),
+      pendingIds: [],
     };
   }
 
@@ -2657,14 +2737,13 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
   if (!options.threadFetcher && !cookies.csrfToken) {
     throw new Error('Thread sync requires X browser cookies with ct0/auth_token; pass --cookies or a browser profile.');
   }
-  const fetcher: ThreadExpansionFetcher = options.threadFetcher
-    ?? ((record) => expandThreadForRecord(record, cookies, delayMs));
-
   let contextFilled = 0;
   let belowFilled = 0;
   let emptyChecked = 0;
   let failed = 0;
   const failures: ThreadSyncFailure[] = [];
+  const completedIds = scopedRecords.filter((record) => !shouldSyncThread(record, nowMs)).map((record) => record.id);
+  const pendingIds: string[] = [];
   const dbUpdates: Array<{
     id: string;
     threadContext?: ThreadTweetSnapshot[];
@@ -2688,6 +2767,11 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
       dbUpdates.length = 0;
     }
   };
+  const fetcher: ThreadExpansionFetcher = options.threadFetcher
+    ?? ((record) => expandThreadForRecord(record, cookies, delayMs, async () => {
+      queueThreadUpdate(record);
+      await persistProgress();
+    }));
 
   for (let i = 0; i < candidates.length; i++) {
     const record = candidates[i];
@@ -2696,10 +2780,15 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
     try {
       const expanded = await fetcher(record);
       status = expanded.status;
+      if (expanded.capture) record.threadCapture = expanded.capture;
       if (expanded.status === 'ok') {
         record.threadContext = expanded.context;
         record.threadBelow = expanded.below;
-        record.threadExpandedAt = now;
+        record.threadCapture ??= { status: 'complete', checkedAt: now, retryable: false,
+          parentsComplete: true, detailComplete: true, pagesFetched: 0 };
+        if (record.threadCapture.status === 'complete') record.threadExpandedAt = now;
+        if (record.threadCapture.retryable) pendingIds.push(record.id);
+        else completedIds.push(record.id);
         delete record.threadExpansionFailedAt;
         if (expanded.context.length > 0) contextFilled++;
         if (expanded.below.length > 0) belowFilled++;
@@ -2745,6 +2834,9 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
 
     if (isPermanentThreadFailure(status)) {
       record.threadExpansionFailedAt = now;
+      record.threadCapture = { ...(record.threadCapture ?? { parentsComplete: false, detailComplete: false, pagesFetched: 0 }),
+        status: 'unavailable', checkedAt: now, retryable: false, reason: `focal_${status}` };
+      completedIds.push(record.id);
       queueThreadUpdate(record);
     }
 
@@ -2768,6 +2860,8 @@ export async function syncThreads(options: SyncThreadsOptions = {}): Promise<Thr
     belowFilled,
     emptyChecked,
     failed,
+    completedIds,
+    pendingIds,
     failures,
     total,
   };
