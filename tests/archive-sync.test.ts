@@ -490,3 +490,26 @@ test('empty backlog-only never expands the full archive or fetches a folder inve
     assert.equal(process.exitCode, 0);
   });
 });
+
+test('a folder guardrail removes already checkpointed assignments from the pending report', async () => {
+  await withArchive(async (directory, write) => {
+    const statePath = path.join(directory, 'logs/archive-sync-state.json');
+    mkdirSync(path.dirname(statePath));
+    writeFileSync(statePath, JSON.stringify({ nextBacklogStage: 'folders', pending: { folders: ['old', 'missing'] } }));
+    execFileSync('git', ['-C', directory, 'add', '-A']);
+    execFileSync('git', ['-C', directory, 'commit', '-m', 'Save pending folders']);
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--backlog-only'], {
+      folders: async (options) => {
+        write([{ ...record('old'), folderIds: ['f'], folderNames: ['Research'] }]);
+        options?.onCheckpoint?.({ id: 'f', name: 'Research' });
+        throw new HttpSafetyStopError('fixture stop', 'request budget reached');
+      },
+    });
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    assert.deepEqual(summary.pending.folders, ['missing']);
+    assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).pending.folders, ['missing']);
+    assert.equal(summary.backlog.after.uniqueBookmarks, 1);
+    assert.equal(summary.paused, 'request budget reached');
+    assert.equal(process.exitCode, 2);
+  });
+});

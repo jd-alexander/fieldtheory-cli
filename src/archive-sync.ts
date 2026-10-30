@@ -344,8 +344,13 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       if (result) {
         pending.folders = result.coverage?.remainingRecordIds ?? [];
         folderResumeAfterId = pending.folders.length ? result.perFolder.at(-1)?.folder.id ?? folderResumeAfterId : undefined;
-        persistState();
       }
+      // Completed folders are durable even if a later folder exhausted the allowance.
+      const current = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
+      const taggedIds = new Set(current.filter((record) => record.folderIds?.length).map((record) => record.id));
+      pending.folders = pending.folders.filter((id) => !taggedIds.has(id));
+      if (!pending.folders.length) folderResumeAfterId = undefined;
+      persistState();
     };
     const backlogAttempted = Object.fromEntries(backlogStages.map((stage) => [stage, new Set<string>()])) as Record<Stage, Set<string>>;
     let backlogTurn = 0;
