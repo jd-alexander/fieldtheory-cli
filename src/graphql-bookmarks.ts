@@ -1453,6 +1453,9 @@ export interface FolderSyncOptions {
   pruneMissingFolderTags?: boolean;
   /** Limit target folders after live X order/name/id resolution. Useful for recent-folder reconciliation. */
   folderLimit?: number;
+  /** Continue a bounded reconciliation after the last durably saved folder, wrapping in live order. */
+  resumeAfterFolderId?: string;
+  onCheckpoint?: (folder: BookmarkFolder) => void;
   /** Stop walking additional folders once these local record ids have at least one folder tag. */
   stopWhenRecordIdsTagged?: string[];
   /** Include all currently untagged records as folder reconciliation targets. */
@@ -1550,10 +1553,12 @@ export function resolveBookmarkFolderTargets(
   return resolved;
 }
 
-export function limitBookmarkFolderTargets(folders: BookmarkFolder[], limit?: number): BookmarkFolder[] {
-  if (limit == null) return folders;
+export function limitBookmarkFolderTargets(folders: BookmarkFolder[], limit?: number, resumeAfterId?: string): BookmarkFolder[] {
+  const previous = resumeAfterId ? folders.findIndex((folder) => folder.id === resumeAfterId) : -1;
+  const ordered = previous < 0 ? folders : [...folders.slice(previous + 1), ...folders.slice(0, previous + 1)];
+  if (limit == null) return ordered;
   if (!Number.isFinite(limit) || limit < 1) return [];
-  return folders.slice(0, Math.floor(limit));
+  return ordered.slice(0, Math.floor(limit));
 }
 
 export function getFolderTagCoverage(records: BookmarkRecord[], recordIds: string[]): FolderTagCoverage {
@@ -1781,6 +1786,7 @@ export async function syncBookmarkFolders(
     : limitBookmarkFolderTargets(
         resolveBookmarkFolderTargets(allFolders, options),
         options.folderLimit,
+        options.resumeAfterFolderId,
       );
   let coverage = coverageTargetIds.length > 0
     ? getFolderTagCoverage(existing, coverageTargetIds)
@@ -1849,6 +1855,7 @@ export async function syncBookmarkFolders(
     await persistFolderCheckpoint(cachePath, metaPath, existing);
     folderState = updateFolderSyncedState(folderState, folder, walkResult.records, mirror.stats, new Date().toISOString());
     await writeJson(folderStatePath, folderState);
+    options.onCheckpoint?.(folder);
 
     if (coverage) {
       coverage = getFolderTagCoverage(existing, coverageTargetIds);

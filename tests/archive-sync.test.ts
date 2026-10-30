@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'nod
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireSyncLock, archiveSyncMain, availableRequestBudget, recentFolderBookmarks, renderBatchPreview } from '../src/archive-sync.js';
+import { acquireSyncLock, archiveSyncMain, availableRequestBudget, backlogCounts, recentFolderBookmarks, renderBatchPreview } from '../src/archive-sync.js';
 import { HttpSafetyStopError } from '../src/http-safety.js';
 import { selectThreadBackfill, threadCoverageReport, threadCoverageLabel } from '../src/thread-coverage.js';
 import type { BookmarkRecord } from '../src/types.js';
@@ -127,7 +127,7 @@ test('archive command saves a budget pause and resumes enrichment for the origin
       },
     });
     const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
-    assert.deepEqual(phases, ['threads', 'gaps', 'media', 'folders']);
+    assert.deepEqual(phases, ['gaps', 'threads', 'gaps', 'media', 'folders']);
     assert.equal(summary.newCount, 0);
     assert.equal(summary.batchCount, 1);
     assert.equal(summary.media.downloaded, 1);
@@ -258,11 +258,11 @@ test('focused conversations run before old backlog and include newly discovered 
       gaps: async () => ({ total: 0, quotedTweetsFilled: 0, textExpanded: 0, articlesEnriched: 0, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 0, failed: 0, failures: [] }),
       media: async (options) => {
         phases.push('media');
-        assert.deepEqual(options?.onlyTweetIds, ['a', 'b', 'c', 'old']);
+        assert.deepEqual(options?.onlyTweetIds, phases.includes('threads') ? ['a', 'b', 'c'] : ['old']);
         return { schemaVersion: 1, generatedAt: '', limit: 0, maxBytes: 10, processed: 0, downloaded: 0, failed: 0, skippedTooLarge: 0, entries: [] };
       },
     });
-    assert.deepEqual(phases, ['focus', 'comments:b', 'comments:c', 'threads', 'media']);
+    assert.deepEqual(phases, ['focus', 'comments:b', 'comments:c', 'media', 'threads', 'media']);
     const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
     assert.equal(summary.newCount, 3);
     assert.equal(summary.conversations.length, 2);
@@ -351,5 +351,142 @@ test('default backfill is bounded, new bookmarks go first, and partial threads r
     assert.equal(summary.threadCoverage.partial, 1);
     assert.equal(summary.threadCoverage.unchecked, 2);
     assert.equal(process.exitCode, 2);
+  });
+});
+
+test('backlog counts deduplicate bookmarks shared by multiple stage queues', () => {
+  assert.deepEqual(backlogCounts({ threads: ['a', 'b'], media: ['b', 'c'], folders: ['a'] }), {
+    uniqueBookmarks: 3, stages: { gaps: 0, media: 2, folders: 1, threads: 2 },
+  });
+});
+
+test('backlog-only skips head and historical checks, drains stages and preserves downstream work from thread discovery', async () => {
+  await withArchive(async (directory, write) => {
+    const statePath = path.join(directory, 'logs/archive-sync-state.json');
+    mkdirSync(path.dirname(statePath));
+    writeFileSync(statePath, JSON.stringify({ timelineCursor: 'unfinished-head', pending: {
+      threads: ['old'], gaps: ['old'], media: ['old'], folders: ['old'],
+    } }));
+    execFileSync('git', ['-C', directory, 'add', '-A']);
+    execFileSync('git', ['-C', directory, 'commit', '-m', 'Save backlog']);
+    const calls: string[] = [];
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--backlog-only'], {
+      timeline: async () => { throw new Error('Backlog-only must not fetch the head'); },
+      gaps: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['old']); calls.push('gaps');
+        return { total: 0, quotedTweetsFilled: 0, textExpanded: 0, articlesEnriched: 0, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 0, failed: 0, failures: [] };
+      },
+      media: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['old']); calls.push('media');
+        return { schemaVersion: 1, generatedAt: '', limit: 0, maxBytes: 10, processed: 0, downloaded: 0, failed: 0, skippedTooLarge: 0, entries: [] };
+      },
+      folders: async () => {
+        calls.push('folders');
+        write([{ ...record('old'), folderIds: ['f'], folderNames: ['Research'] }]);
+        return { folders: [], perFolder: [], targetFolderCount: 1, totalAdded: 0, totalTagged: 1, totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [],
+          coverage: { targetRecordIds: 1, taggedRecordIds: 1, remainingRecordIds: [], stoppedAfterCoverage: true } };
+      },
+      threads: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['old']); calls.push('threads');
+        return { total: 1, contextFilled: 0, belowFilled: 1, emptyChecked: 0, failed: 0, failures: [], completedIds: ['old'] };
+      },
+    });
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    assert.deepEqual(calls, ['gaps', 'media', 'folders', 'threads']);
+    assert.equal(state.timelineCursor, 'unfinished-head');
+    assert.deepEqual(state.pending, { threads: [], gaps: ['old'], media: ['old'], folders: [] });
+    assert.equal(summary.mode, 'backlog-only');
+    assert.deepEqual(summary.threadBackfillIds, []);
+    assert.equal(summary.newCount, 0);
+    assert.equal(process.exitCode, 2);
+  });
+});
+
+test('backlog rotation survives guardrail pauses and durably resumes the folder cursor', async () => {
+  await withArchive(async (directory) => {
+    const statePath = path.join(directory, 'logs/archive-sync-state.json');
+    mkdirSync(path.dirname(statePath));
+    writeFileSync(statePath, JSON.stringify({ pending: { threads: ['old'], gaps: ['old'], media: ['old'], folders: ['old'] } }));
+    const commit = (): void => {
+      execFileSync('git', ['-C', directory, 'add', '-A']);
+      execFileSync('git', ['-C', directory, 'commit', '-m', 'Save paused backlog']);
+      process.exitCode = 0;
+    };
+    commit();
+    const calls: string[] = [];
+    const stop = (): never => { throw new HttpSafetyStopError('fixture stop', 'request budget reached'); };
+    for (const expected of ['media', 'folders', 'threads']) {
+      await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--backlog-only'], {
+        timeline: async () => { throw new Error('No head fetch'); },
+        gaps: async () => { calls.push('gaps'); return stop(); },
+        media: async () => { calls.push('media'); return stop(); },
+        folders: async (options) => {
+          calls.push('folders');
+          options?.onCheckpoint?.({ id: 'saved-folder', name: 'Research' });
+          assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).folderResumeAfterId, 'saved-folder');
+          return stop();
+        },
+        threads: async () => { throw new Error('Must stop at the first paused stage'); },
+      });
+      assert.equal(process.exitCode, 2);
+      assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).nextBacklogStage, expected);
+      commit();
+    }
+    assert.deepEqual(calls, ['gaps', 'media', 'folders']);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    state.nextBacklogStage = 'folders';
+    writeFileSync(statePath, JSON.stringify(state));
+    commit();
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--backlog-only'], {
+      folders: async (options) => { assert.equal(options?.resumeAfterFolderId, 'saved-folder'); return stop(); },
+    });
+    assert.equal(process.exitCode, 2);
+  });
+});
+
+test('ordinary sync services saved work before fresh threads and does not grow historical backfill while queues exist', async () => {
+  await withArchive(async (directory, write) => {
+    const statePath = path.join(directory, 'logs/archive-sync-state.json');
+    mkdirSync(path.dirname(statePath));
+    writeFileSync(statePath, JSON.stringify({ pending: { gaps: ['old'] } }));
+    execFileSync('git', ['-C', directory, 'add', '-A']);
+    execFileSync('git', ['-C', directory, 'commit', '-m', 'Save backlog']);
+    const calls: string[] = [];
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push'], {
+      timeline: async () => {
+        calls.push('head'); write([record('new'), record('old')]);
+        return { added: 1, totalBookmarks: 2, pages: 1, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 2,
+          stopReason: 'caught up to newest stored bookmark', cachePath: '', statePath: '' };
+      },
+      gaps: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['old']); calls.push('old-gap');
+        return { total: 0, quotedTweetsFilled: 0, textExpanded: 0, articlesEnriched: 0, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 0, failed: 0, failures: [] };
+      },
+      threads: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['new']); calls.push('new-thread');
+        throw new HttpSafetyStopError('fixture stop', 'request budget reached');
+      },
+    });
+    assert.deepEqual(calls, ['head', 'old-gap', 'new-thread']);
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    assert.deepEqual(summary.threadBackfillIds, []);
+    assert.deepEqual(summary.pending.gaps, ['new']);
+    assert.deepEqual(summary.pending.media, ['new']);
+    assert.equal(process.exitCode, 2);
+  });
+});
+
+test('empty backlog-only never expands the full archive or fetches a folder inventory', async () => {
+  await withArchive(async (directory) => {
+    const unexpected = async (): Promise<never> => { throw new Error('No requests for an empty saved backlog'); };
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--backlog-only'], {
+      timeline: unexpected, threads: unexpected, gaps: unexpected, media: unexpected, folders: unexpected, conversation: unexpected,
+    });
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    assert.equal(summary.batchCount, 0);
+    assert.equal(summary.backlog.after.uniqueBookmarks, 0);
+    assert.equal(summary.paused, null);
+    assert.equal(process.exitCode, 0);
   });
 });

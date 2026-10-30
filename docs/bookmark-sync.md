@@ -8,6 +8,8 @@ x-bookmark-sync
 
 It fetches the latest bookmarks, then enriches groups of ten: same-author threads, quoted text and article gaps, followed by images and capped videos. It then reconciles recent X folders, rebuilds search and Markdown, writes an HTML preview, and commits/pushes the archive's current branch to `origin`. Focused/new bookmarks and resumable threads take priority, followed by earlier unfinished captures and bounded historical backfill. Folder reconciliation stops when the selected bookmarks have folder tags; a routine sync is not a full historical crawl. With no pending folder targets it refreshes the folder inventory only.
 
+When saved work exists, ordinary syncs give one older stage a turn before fresh thread enrichment. That turn rotates durably through gaps, media, folders and threads, including across guardrail pauses. Historical thread checks are not added while saved queues remain. Folder reconciliation checkpoints the last successfully saved folder and continues after it next time, wrapping through live X order instead of repeatedly checking only the first twenty folders.
+
 ## Installation
 
 Requires Node.js 20+, installed repository dependencies, Git/Git LFS, an existing clean archive repository and a configured X browser session. Install dependencies with `npm ci` on a fresh checkout, then:
@@ -27,6 +29,7 @@ Do not overwrite an existing command or skill without inspecting it. Keep `~/.lo
 ```bash
 x-bookmark-sync --check       # Local prerequisites and remaining request allowance
 x-bookmark-sync --no-push     # Fetch and export, leaving changes uncommitted
+x-bookmark-sync --backlog-only # Work through saved queues, without fetching the bookmark head
 x-bookmark-sync --focus-folder Ads --comments 3  # Prioritize Ads and archive public conversations
 x-bookmark-sync --help
 ```
@@ -36,6 +39,10 @@ x-bookmark-sync --help
 The command locks concurrent invocations for the same archive, requires a clean initial working tree, fetches and fast-forwards the archive, and preserves pending stage IDs and any unfinished timeline cursor. A later sync resumes that cursor before returning to ordinary head checks. An extraction pause still exports and publishes saved progress. It does not loop around the guardrails or force-push. A failed push leaves the commit locally for inspection/retry. No cookie/token values are passed on the command line or stored in the skill.
 
 Exit codes: **0** completed planned stages, **1** error, **2** partial progress with queued work. Check `previews/latest-fetch-summary.json` for individual extraction failures even on exit 0. Oversized media remains linked with a recorded skip reason. Deleted/inaccessible posts and unavailable external pages cannot be guaranteed complete. The HTML preview includes captured batch data and local assets; the foldered Markdown excludes bookmarks whose folder membership is still unknown, while raw JSONL preserves them.
+
+Use `--backlog-only` for an explicitly requested catch-up pass. It rotates batches of up to ten queued IDs per enrichment stage, attempts at most one bounded folder pass, and does not add historical thread checks or fetch the bookmark head. Any unfinished head cursor is preserved for a later ordinary sync. Folder walks can incidentally discover additional bookmarks; those are saved and queued, not discarded. Articles/media discovered after a thread pass stay queued even if those downstream stages already ran. This mode has the same request allowance, spacing, cooldowns, exports and Git publication as ordinary sync; stop at a guardrail rather than repeatedly relaunching it. It cannot be combined with `--focus-folder` or `--comments`.
+
+The summary's `backlog.before` and `backlog.after` report both per-stage counts and **distinct bookmark counts**. One bookmark can need several stages, so adding the stage counts overstates the number of affected bookmarks. This pending inventory is separate from unchecked historical thread coverage.
 
 ## Thread Coverage And Backfill
 

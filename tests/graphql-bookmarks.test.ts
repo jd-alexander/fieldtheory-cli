@@ -2695,7 +2695,18 @@ test('folder snapshots preserve page order when X reuses sort indices across pag
       return new Response(JSON.stringify({ data: { bookmark_collection_timeline: { timeline: { instructions: [{ type: 'TimelineAddEntries', entries }] } } } }), { status: 200 });
     }) as typeof fetch;
     try {
-      await syncBookmarkFolders({ csrfToken: 'test', cookieHeader: 'ct0=test', onlyFolderName: 'Ads', delayMs: 0 });
+      const checkpoints: string[] = [];
+      await syncBookmarkFolders({ csrfToken: 'test', cookieHeader: 'ct0=test', onlyFolderName: 'Ads', delayMs: 0,
+        onCheckpoint: (folder) => {
+          const durable = JSON.parse(readFileSync(path.join(process.env.FT_DATA_DIR!, 'bookmark-folders-state.json'), 'utf8'));
+          assert.equal(durable.folders[0].recordCount, 2);
+          assert.ok(durable.folders[0].lastSyncedAt);
+          const saved = readFileSync(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8');
+          assert.ok(saved.includes('1000000000000000001'));
+          assert.ok(saved.includes('1000000000000000002'));
+          checkpoints.push(folder.id);
+        } });
+      assert.deepEqual(checkpoints, ['folder']);
       const state = JSON.parse(await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmark-folders-state.json'), 'utf8'));
       assert.deepEqual(state.folders[0].orderedRecordIds, ['1000000000000000001', '1000000000000000002']);
       assert.equal(state.folders[0].recordCount, 2);
@@ -3113,6 +3124,14 @@ test('resolveBookmarkFolderTargets: defaults to all folders when no filter is se
 test('limitBookmarkFolderTargets: keeps X live order while bounding recent folder walks', () => {
   assert.deepEqual(limitBookmarkFolderTargets(FOLDERS, 2).map((folder) => folder.id), ['f1', 'f2']);
   assert.deepEqual(limitBookmarkFolderTargets(FOLDERS).map((folder) => folder.id), ['f1', 'f2', 'f3', 'f4']);
+});
+
+test('limitBookmarkFolderTargets: resumes after a saved folder, wraps and tolerates deleted cursors', () => {
+  assert.deepEqual(limitBookmarkFolderTargets(FOLDERS, 2, 'f2').map((folder) => folder.id), ['f3', 'f4']);
+  assert.deepEqual(limitBookmarkFolderTargets(FOLDERS, 3, 'f3').map((folder) => folder.id), ['f4', 'f1', 'f2']);
+  assert.deepEqual(limitBookmarkFolderTargets(FOLDERS, 2, 'deleted').map((folder) => folder.id), ['f1', 'f2']);
+  assert.deepEqual(limitBookmarkFolderTargets([], 2, 'f1'), []);
+  assert.deepEqual(limitBookmarkFolderTargets(FOLDERS, 0, 'f2'), []);
 });
 
 test('getFolderTagCoverage: treats untagged target ids as pending reconciliation', () => {

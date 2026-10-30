@@ -24,7 +24,19 @@ interface AuditEntry {
   errorName?: string;
   responseHeaders?: Record<string, string>;
 }
-interface SyncState { pending?: Pending; timelineCursor?: string; pendingConversations?: string[]; }
+const backlogStages: Stage[] = ['gaps', 'media', 'folders', 'threads'];
+interface SyncState {
+  pending?: Pending;
+  timelineCursor?: string;
+  pendingConversations?: string[];
+  nextBacklogStage?: Stage;
+  folderResumeAfterId?: string;
+}
+
+export function backlogCounts(pending: Partial<Pending>) {
+  return { uniqueBookmarks: new Set(Object.values(pending).flat()).size,
+    stages: Object.fromEntries(backlogStages.map((stage) => [stage, pending[stage]?.length ?? 0])) };
+}
 
 interface ArchiveSyncServices {
   timeline: typeof syncBookmarksGraphQL;
@@ -155,6 +167,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     .option('--data-dir <path>', 'Archive directory (default: FT_DATA_DIR or ~/.fieldtheory/bookmarks)')
     .option('--no-push', 'Keep changes local; do not commit or push')
     .option('--check', 'Check local prerequisites and request allowance without syncing')
+    .option('--backlog-only', 'Process saved queues without fetching the bookmark head or adding historical checks')
     .option('--request-budget <n>', 'Total controlled requests across all stages', positive, 240)
     .option('--hourly-budget <n>', 'Maximum requests including recent saved audit logs', positive, 300)
     .option('--recent-folders <n>', 'Maximum folders to reconcile in X order', positive, 20)
@@ -172,6 +185,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     .option('--firefox-profile-dir <path>', 'Firefox profile');
   program.parse(argv);
   const options = program.opts();
+  if (options.backlogOnly && (options.focusFolder || options.comments)) throw new Error('--backlog-only cannot be combined with --focus-folder or --comments.');
   if (options.comments && !options.focusFolder) throw new Error('--comments requires --focus-folder.');
   const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: options.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
   if (options.dataDir) process.env.FT_DATA_DIR = path.resolve(options.dataDir);
@@ -202,8 +216,11 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const statePath = path.join(logs, 'archive-sync-state.json');
     const saved = jsonFile<SyncState>(statePath, {});
     let timelineCursor = saved.timelineCursor;
+    let nextBacklogStage = backlogStages.includes(saved.nextBacklogStage!) ? saved.nextBacklogStage! : backlogStages[0];
+    let folderResumeAfterId = saved.folderResumeAfterId;
     let pendingConversations = [...new Set(saved.pendingConversations ?? [])];
     const pending: Pending = { threads: [], gaps: [], media: [], folders: [], ...saved.pending };
+    const backlogBefore = backlogCounts(pending);
     const startedAt = new Date().toISOString();
     const runId = startedAt.replace(/[:.]/g, '-');
     const previewDir = path.join(directory, 'previews');
@@ -213,7 +230,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       requestBudget: Math.max(1, allowance), maxRequestsPerHour: options.hourlyBudget, rateLimitFloor: 120 });
     const auth = { browser: options.browser, chromeProfileDirectory: options.chromeProfileDirectory, firefoxProfileDir: options.firefoxProfileDir };
     const stages: Record<string, unknown> = {};
-    const persistState = (): void => saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations });
+    const persistState = (): void => saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations, nextBacklogStage, folderResumeAfterId });
     let paused: string | undefined = allowance === 0 ? 'hourly request budget reached' : undefined;
     const freshAudit = (): AuditEntry[] => auditEntries(logs).filter((entry) => entry.ts >= startedAt);
     const run = async <T>(name: string, task: () => Promise<T>): Promise<T | undefined> => {
@@ -237,7 +254,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         return undefined;
       }
     };
-    const timeline = await run('timeline', () => services.timeline({ ...auth, incremental: true, resumeCursor: timelineCursor, maxPages: 12,
+    const timeline = options.backlogOnly ? undefined : await run('timeline', () => services.timeline({ ...auth, incremental: true, resumeCursor: timelineCursor, maxPages: 12,
       delayMs: 3000, maxMinutes: 15, onProgress: (p) => console.log(`[timeline] page ${p.page}: ${p.newAdded} new`) }));
     if (timeline) {
       if (['caught up to newest stored bookmark', 'end of bookmarks', 'no new bookmarks (stale)'].includes(timeline.stopReason)) timelineCursor = undefined;
@@ -259,7 +276,8 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     if (options.focusFolder && !focusedSnapshot?.orderedRecordIds && !paused) paused = 'Focused folder has no ordered snapshot';
     const focused = options.focusFolder ? recentFolderBookmarks(captured, options.focusFolder, focusedSnapshot?.orderedRecordIds ?? []) : [];
     const resumableIds = captured.filter((record) => record.threadCapture?.retryable).map((record) => record.id);
-    const backfillIds = selectThreadBackfill(captured, new Set([...pending.threads, ...focused.map((record) => record.id)]), options.threadBackfill);
+    const backfillIds = options.backlogOnly || backlogBefore.uniqueBookmarks ? []
+      : selectThreadBackfill(captured, new Set([...pending.threads, ...focused.map((record) => record.id)]), options.threadBackfill);
     pending.threads = [...new Set([...pending.threads, ...resumableIds, ...backfillIds])];
     const priorityIds = [...new Set([...focused.map((record) => record.id), ...newIds, ...resumableIds])];
     const conversationTargets = options.comments ? [...focused].sort((a, b) =>
@@ -270,9 +288,9 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       for (const stage of ['threads', 'gaps', 'media'] as Stage[]) {
         pending[stage] = [...new Set([...focusedIds, ...pending[stage]])];
       }
-      const tagged = new Set(captured.filter((record) => record.folderIds?.length).map((record) => record.id));
-      pending.folders = pending.folders.filter((id) => !tagged.has(id));
     }
+    const tagged = new Set(captured.filter((record) => record.folderIds?.length).map((record) => record.id));
+    pending.folders = pending.folders.filter((id) => !tagged.has(id));
     persistState();
     const conversations = [];
     for (const tweetId of [...pendingConversations]) {
@@ -292,8 +310,68 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       pending[stage] = pending[stage].filter((id) => !completed.has(id));
       persistState();
     };
-    const attempted = new Set<string>();
     const gapFailures: unknown[] = [];
+    const processStage = async (stage: Exclude<Stage, 'folders'>, ids: string[], name: string): Promise<void> => {
+      if (stage === 'threads') {
+        // A guardrail can interrupt after saving thread pages, before the service returns.
+        for (const downstream of ['gaps', 'media'] as Stage[]) pending[downstream] = [...new Set([...pending[downstream], ...ids])];
+        persistState();
+        const result = await run(name, () => services.threads({ ...auth, onlyTweetIds: ids, delayMs: 5000,
+          onProgress: (p) => console.log(`[threads] ${p.done}/${p.total}, ${p.belowFilled} continuation chains`) }));
+        if (result) completeStage('threads', result.completedIds ?? ids);
+      } else if (stage === 'gaps') {
+        const result = await run(name, () => services.gaps({ ...auth, onlyTweetIds: ids, articleLimit: ids.length, delayMs: 5000,
+          onProgress: (p) => console.log(`[gaps] ${p.done}/${p.total}, ${p.articlesEnriched} articles, ${p.failed} misses`) }));
+        if (result) {
+          gapFailures.push(...result.failures);
+          saveJson(path.join(directory, 'gaps-failures.json'), { failures: gapFailures });
+          completeStage('gaps', ids);
+        }
+      } else {
+        const result = await run(name, () => services.media({ onlyTweetIds: ids, skipProfileImages: true, mediaQuality: 'large',
+          onProgress: (p) => console.log(`[media] ${p.processed} processed, ${p.downloaded} downloaded, ${p.failed} failed`) }));
+        if (result?.stopReason) paused = result.stopReason;
+        else if (result && result.failed === 0) completeStage('media', ids);
+      }
+    };
+    let foldersAttempted = false;
+    const reconcileFolders = async (name: string): Promise<void> => {
+      foldersAttempted = true;
+      const result = await run(name, () => services.folders({ ...auth, folderLimit: pending.folders.length ? options.recentFolders : 0,
+        resumeAfterFolderId: folderResumeAfterId, stopWhenRecordIdsTagged: pending.folders, reconcileUntaggedRecords: false, delayMs: 3000,
+        onCheckpoint: (folder) => { folderResumeAfterId = folder.id; persistState(); },
+        onProgress: (p) => { if (p.folder && p.phase === 'walking') console.log(`[folders] ${p.folder.name}`); } }));
+      if (result) {
+        pending.folders = result.coverage?.remainingRecordIds ?? [];
+        folderResumeAfterId = pending.folders.length ? result.perFolder.at(-1)?.folder.id ?? folderResumeAfterId : undefined;
+        persistState();
+      }
+    };
+    const backlogAttempted = Object.fromEntries(backlogStages.map((stage) => [stage, new Set<string>()])) as Record<Stage, Set<string>>;
+    let backlogTurn = 0;
+    const maintainBacklog = async (): Promise<boolean> => {
+      for (let offset = 0; offset < backlogStages.length; offset++) {
+        const stage = backlogStages[(backlogStages.indexOf(nextBacklogStage) + offset) % backlogStages.length];
+        if (stage === 'folders' && foldersAttempted) continue;
+        const savedIds = new Set(saved.pending?.[stage] ?? []);
+        const ids = pending[stage].filter((id) => !backlogAttempted[stage].has(id) && (options.backlogOnly || savedIds.has(id))).slice(0, 10);
+        if (!ids.length) continue;
+        ids.forEach((id) => backlogAttempted[stage].add(id));
+        // Rotate before the request: a budget pause must not starve the next stage next run.
+        nextBacklogStage = backlogStages[(backlogStages.indexOf(stage) + 1) % backlogStages.length];
+        persistState();
+        const name = `backlog-${stage}-${++backlogTurn}`;
+        if (stage === 'folders') await reconcileFolders(name);
+        else await processStage(stage, ids, name);
+        return true;
+      }
+      return false;
+    };
+    if (options.backlogOnly) {
+      while (!paused && await maintainBacklog()) { /* One bounded pass per queued stage/id. */ }
+    } else if (!paused) await maintainBacklog();
+
+    const attempted = new Set<string>();
     let chunk = 0;
     const enrich = async (): Promise<void> => {
       while (!paused) {
@@ -306,42 +384,21 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         const selected = (stage: Stage): string[] => pending[stage].filter((id) => ids.includes(id));
         const threadIds = selected('threads');
         if (threadIds.length) {
-          const threads = await run(`threads-${chunk}`, () => services.threads({ ...auth, onlyTweetIds: threadIds, delayMs: 5000,
-            onProgress: (p) => console.log(`[threads] ${p.done}/${p.total}, ${p.belowFilled} continuation chains`) }));
-          if (threads) {
-            completeStage('threads', threads.completedIds ?? threadIds);
-            // Newly discovered continuation assets and articles need their own downstream pass.
-            for (const stage of ['gaps', 'media'] as Stage[]) pending[stage] = [...new Set([...pending[stage], ...threadIds])];
-            persistState();
-          }
+          await processStage('threads', threadIds, `threads-${chunk}`);
         }
         const gapIds = selected('gaps');
         if (gapIds.length) {
-          const gaps = await run(`gaps-${chunk}`, () => services.gaps({ ...auth, onlyTweetIds: gapIds, articleLimit: gapIds.length, delayMs: 5000,
-            onProgress: (p) => console.log(`[gaps] ${p.done}/${p.total}, ${p.articlesEnriched} articles, ${p.failed} misses`) }));
-          if (gaps) {
-            gapFailures.push(...gaps.failures);
-            saveJson(path.join(directory, 'gaps-failures.json'), { failures: gapFailures });
-            completeStage('gaps', gapIds);
-          }
+          await processStage('gaps', gapIds, `gaps-${chunk}`);
         }
         const mediaIds = selected('media');
         if (mediaIds.length) {
-          const media = await run(`media-${chunk}`, () => services.media({ onlyTweetIds: mediaIds, skipProfileImages: true, mediaQuality: 'large',
-            onProgress: (p) => console.log(`[media] ${p.processed} processed, ${p.downloaded} downloaded, ${p.failed} failed`) }));
-          if (media?.stopReason) paused = media.stopReason;
-          else if (media && media.failed === 0) completeStage('media', mediaIds);
+          await processStage('media', mediaIds, `media-${chunk}`);
         }
       }
     };
-    await enrich();
-    const folderTargets = pending.folders;
-    const folders = await run('folders', () => services.folders({ ...auth, folderLimit: folderTargets.length ? options.recentFolders : 0,
-      stopWhenRecordIdsTagged: folderTargets, reconcileUntaggedRecords: false, delayMs: 3000,
-      onProgress: (p) => { if (p.folder && p.phase === 'walking') console.log(`[folders] ${p.folder.name}`); } }));
-    if (folders) {
-      pending.folders = folders.coverage?.remainingRecordIds ?? [];
-      persistState();
+    if (!options.backlogOnly) {
+      await enrich();
+      if (!foldersAttempted) await reconcileFolders('folders');
     }
     // Folder walks can discover bookmarks absent from the all-bookmarks timeline.
     const records = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
@@ -349,7 +406,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     for (const stage of ['threads', 'gaps', 'media'] as Stage[]) pending[stage] = [...new Set([...pending[stage], ...folderOnlyIds])];
     if (folderOnlyIds.length) {
       persistState();
-      await enrich();
+      if (!options.backlogOnly) await enrich();
     }
     const finalRecords = folderOnlyIds.length ? await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath()) : records;
     const batchIds = new Set([...newIds, ...folderOnlyIds, ...focused.map((record) => record.id), ...backfillIds, ...resumableIds, ...Object.values(saved.pending ?? {}).flat()]);
@@ -371,6 +428,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       startedAt, generatedAt: new Date().toISOString(), beforeCount: initial.length, afterCount: records.length,
       newCount: records.length - initial.length, batchCount: batch.length, paused: paused ?? null,
       pending, pendingConversations, conversations, focusFolder: options.focusFolder,
+      mode: options.backlogOnly ? 'backlog-only' : 'sync', backlog: { before: backlogBefore, after: backlogCounts(pending) },
       conversationTargets: conversationTargets.map((record) => ({ tweetId: record.tweetId, url: record.url,
         authorHandle: record.authorHandle, text: record.text.slice(0, 240), reportedReplies: record.engagement?.replyCount })),
       timelineCursor, stages, exported, previewPath, threadCoverage: threadCoverageReport(finalRecords), batchThreadCoverage: threadCoverageReport(batch), threadBackfillIds: backfillIds,
@@ -385,7 +443,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         networkErrors: requests.filter((entry) => entry.status == null).length,
         minRemaining: remaining.length ? Math.min(...remaining) : null },
     };
-    saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations, paused: summary.paused });
+    saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations, nextBacklogStage, folderResumeAfterId, paused: summary.paused });
     saveJson(path.join(previewDir, 'latest-new-ids-full.json'), { generatedAt: summary.generatedAt, newCount: summary.newCount,
       beforeCount: initial.length, afterCount: records.length, ids: [...batchIds], bookmarks: batch });
     saveJson(path.join(previewDir, 'latest-fetch-summary.json'), summary);
@@ -397,7 +455,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       console.log(`Pushed ${git(directory, 'rev-parse', '--short', 'HEAD')} to origin/${branch}`);
     }
     console.log(JSON.stringify({ newCount: summary.newCount, afterCount: summary.afterCount, media: summary.media,
-      audit: summary.audit, paused: summary.paused, pending: Object.fromEntries(Object.entries(pending).map(([stage, ids]) => [stage, ids.length])),
+      audit: summary.audit, paused: summary.paused, backlog: summary.backlog, pending: Object.fromEntries(Object.entries(pending).map(([stage, ids]) => [stage, ids.length])),
       pendingConversations, conversations, previewPath }, null, 2));
     if (paused || pendingConversations.length || Object.values(pending).some((ids) => ids.length)) process.exitCode = 2;
   } finally { release(); }
