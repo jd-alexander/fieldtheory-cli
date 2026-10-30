@@ -22,9 +22,13 @@ export interface HttpSafetyConfig {
   requestBudget?: number;
   maxRequestsPerHour?: number;
   rateLimitFloor?: number;
+  /** Stop before making requests after this absolute deadline. */
+  stopAt?: number;
+  stopOnBlockedResponse?: boolean;
 }
 
-type HttpSafetyStopReason = 'request budget reached' | 'hourly request budget reached' | 'rate limit floor reached';
+type HttpSafetyStopReason = 'request budget reached' | 'hourly request budget reached' | 'rate limit floor reached'
+  | 'scheduled request window ended' | 'X returned HTTP 429' | 'Authentication or access failure';
 
 export class HttpSafetyStopError extends Error {
   constructor(
@@ -45,6 +49,8 @@ interface ResolvedHttpSafetyConfig {
   requestBudget?: number;
   maxRequestsPerHour?: number;
   rateLimitFloor?: number;
+  stopAt?: number;
+  stopOnBlockedResponse: boolean;
 }
 
 const SENSITIVE_HEADER_NAMES = new Set([
@@ -93,6 +99,8 @@ function resolveConfig(config: HttpSafetyConfig = {}): ResolvedHttpSafetyConfig 
     requestBudget: positiveInt(config.requestBudget ?? numberFromEnv('FT_HTTP_REQUEST_BUDGET')),
     maxRequestsPerHour: positiveInt(config.maxRequestsPerHour ?? numberFromEnv('FT_HTTP_MAX_REQUESTS_PER_HOUR')),
     rateLimitFloor: nonNegativeInt(config.rateLimitFloor ?? numberFromEnv('FT_HTTP_RATE_LIMIT_FLOOR')),
+    stopAt: positiveInt(config.stopAt),
+    stopOnBlockedResponse: config.stopOnBlockedResponse ?? false,
   };
 }
 
@@ -189,6 +197,7 @@ class HttpSafetyController {
   private requestCount = 0;
   private requestTimestamps: number[] = [];
   private lastRequestAt = 0;
+  private stopped?: HttpSafetyStopError;
 
   constructor(private readonly config: ResolvedHttpSafetyConfig) {}
 
@@ -223,12 +232,19 @@ class HttpSafetyController {
       response,
     });
 
+    if (this.config.stopOnBlockedResponse && [429, 401, 403].includes(response.status)) {
+      this.stopped = new HttpSafetyStopError(`Unattended fetch stopped on HTTP ${response.status}.`,
+        response.status === 429 ? 'X returned HTTP 429' : 'Authentication or access failure');
+      throw this.stopped;
+    }
     this.stopIfRateLimitFloorReached(response);
     return response;
   }
 
   private async beforeRequest(): Promise<void> {
+    if (this.stopped) throw this.stopped;
     const now = Date.now();
+    this.checkDeadline(now);
     this.requestTimestamps = this.requestTimestamps.filter((ts) => now - ts < 60 * 60_000);
 
     if (this.config.requestBudget != null && this.requestCount >= this.config.requestBudget) {
@@ -255,19 +271,27 @@ class HttpSafetyController {
       }
     }
 
+    this.checkDeadline(Date.now());
     this.requestCount += 1;
     this.requestTimestamps.push(Date.now());
     this.lastRequestAt = Date.now();
+  }
+
+  private checkDeadline(now: number): void {
+    if (this.config.stopAt != null && now >= this.config.stopAt) {
+      throw new HttpSafetyStopError('Scheduled request window ended; saved work can resume later.', 'scheduled request window ended');
+    }
   }
 
   private stopIfRateLimitFloorReached(response: Response): void {
     if (this.config.rateLimitFloor == null || response.status === 429) return;
     const remaining = responseRateRemaining(response);
     if (remaining == null || remaining > this.config.rateLimitFloor) return;
-    throw new HttpSafetyStopError(
+    this.stopped = new HttpSafetyStopError(
       `X rate-limit remaining count (${remaining}) is at or below the configured floor (${this.config.rateLimitFloor}).`,
       'rate limit floor reached',
     );
+    throw this.stopped;
   }
 
   private async audit(input: {

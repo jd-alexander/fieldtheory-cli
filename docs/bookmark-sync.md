@@ -30,6 +30,8 @@ Do not overwrite an existing command or skill without inspecting it. Keep `~/.lo
 x-bookmark-sync --check       # Local prerequisites and remaining request allowance
 x-bookmark-sync --no-push     # Fetch and export, leaving changes uncommitted
 x-bookmark-sync --backlog-only # Work through saved queues, without fetching the bookmark head
+x-bookmark-sync --overnight --check # Inspect unattended limits without network requests
+x-bookmark-sync --overnight   # Slow saved-queue catch-up, only 01:00-06:00 Jamaica time
 x-bookmark-sync --focus-folder Ads --comments 3  # Prioritize Ads and archive public conversations
 x-bookmark-sync --help
 ```
@@ -43,6 +45,16 @@ Exit codes: **0** completed planned stages, **1** error, **2** partial progress 
 Use `--backlog-only` for an explicitly requested catch-up pass. It rotates batches of up to ten queued IDs per enrichment stage, attempts at most one bounded folder pass, and does not add historical thread checks or fetch the bookmark head. Any unfinished head cursor is preserved for a later ordinary sync. Folder walks can incidentally discover additional bookmarks; those are saved and queued, not discarded. Articles/media discovered after a thread pass stay queued even if those downstream stages already ran. This mode has the same request allowance, spacing, cooldowns, exports and Git publication as ordinary sync; stop at a guardrail rather than repeatedly relaunching it. It cannot be combined with `--focus-folder` or `--comments`.
 
 The summary's `backlog.before` and `backlog.after` report both per-stage counts and **distinct bookmark counts**. One bookmark can need several stages, so adding the stage counts overstates the number of affected bookmarks. This pending inventory is separate from unchecked historical thread coverage.
+
+## Overnight Catch-Up
+
+`--overnight` implies `--backlog-only` and enforces an unattended profile in the CLI, not just in the scheduler prompt: at most **80 requests per run**, **120 including the last hour's audit logs**, and **240 including all logged CLI requests on the current Jamaican calendar date**. User-supplied budgets can lower these limits, not raise them. Requests are spaced at least ten seconds apart plus jitter, and stop at a remaining-rate floor of 200. The minimum interval between overnight starts is 90 minutes, retained across ordinary syncs in `lastOvernightStartedAt`.
+
+No fetching starts outside **01:00-06:00 America/Jamaica**, regardless of the commit-date time zone. The HTTP controller stops before a request that would start at or after 06:00, including after a spacing wait. HTTP 429/401/403 and rate-floor stops latch the controller so catching an error cannot silently continue fetching. Saved server reset and Retry-After values are checked across process restarts, even when a 429 is older than the one-hour accounting window; the later valid cooldown header wins. A saved authentication/access pause requires a successful manual recovery before unattended work resumes.
+
+The installed local heartbeat is scheduled for **01:00, 03:00 and 05:00 Jamaica time** until the active saved queues are empty. It invokes this profile once per scheduled slot, never loops around a pause, and uses the normal archive lock, redacted audit logs, resumable exports and Git publication. It must not seed the entire historical unchecked inventory. Keep the Mac awake and online with the desktop app running. If a slot is missed, do not catch up by firing several runs together. An expected local budget/window/cooldown skip is not an extraction failure; authentication problems, dirty archives and publication failures require inspection.
+
+These are conservative local controls, not X-provided guarantees. They cannot measure browser traffic or unrelated tools, guarantee that X will not throttle or restrict the account, or ensure every remote post is accessible.
 
 ## Thread Coverage And Backfill
 

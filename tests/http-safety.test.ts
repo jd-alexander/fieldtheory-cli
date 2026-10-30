@@ -81,3 +81,61 @@ test('controlledFetch stops when the per-run request budget is reached', async (
     resetHttpSafetyForTests();
   }
 });
+
+test('scheduled request deadline prevents requests, including after waiting for spacing', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  const originalTimeout = globalThis.setTimeout;
+  let now = 1_000_000;
+  Date.now = () => now;
+  globalThis.setTimeout = ((handler: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+    now += Number(delay ?? 0);
+    return originalTimeout(handler, 0, ...args);
+  }) as typeof setTimeout;
+  let calls = 0;
+  globalThis.fetch = (async () => { calls++; return new Response('{}'); }) as typeof fetch;
+  try {
+    configureHttpSafety({ minDelayMs: 0, stopAt: Date.now() - 1 });
+    await assert.rejects(() => controlledFetch('https://x.com/test'), (error) =>
+      error instanceof HttpSafetyStopError && error.stopReason === 'scheduled request window ended');
+    assert.equal(calls, 0);
+    configureHttpSafety({ minDelayMs: 50, stopAt: Date.now() + 30 });
+    await controlledFetch('https://x.com/test');
+    await assert.rejects(() => controlledFetch('https://x.com/test'), (error) =>
+      error instanceof HttpSafetyStopError && error.stopReason === 'scheduled request window ended');
+    assert.equal(calls, 1);
+  } finally {
+    Date.now = originalNow; globalThis.setTimeout = originalTimeout;
+    globalThis.fetch = originalFetch; resetHttpSafetyForTests();
+  }
+});
+
+test('unattended response guard stops immediately on 429 and authentication failures', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const status of [429, 401, 403]) {
+      let calls = 0;
+      globalThis.fetch = (async () => { calls++; return new Response('{}', { status }); }) as typeof fetch;
+      configureHttpSafety({ minDelayMs: 0, stopOnBlockedResponse: true });
+      await assert.rejects(() => controlledFetch('https://x.com/test'), (error) =>
+        error instanceof HttpSafetyStopError && error.stopReason === (status === 429 ? 'X returned HTTP 429' : 'Authentication or access failure'));
+      await assert.rejects(() => controlledFetch('https://x.com/test'), HttpSafetyStopError);
+      assert.equal(calls, 1);
+    }
+  } finally { globalThis.fetch = originalFetch; resetHttpSafetyForTests(); }
+});
+
+test('rate-floor stops remain latched even if a caller catches the first stop', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response('{}', { headers: { 'x-rate-limit-remaining': '200' } });
+  }) as typeof fetch;
+  try {
+    configureHttpSafety({ minDelayMs: 0, rateLimitFloor: 200 });
+    await assert.rejects(() => controlledFetch('https://x.com/test'), HttpSafetyStopError);
+    await assert.rejects(() => controlledFetch('https://x.com/test'), HttpSafetyStopError);
+    assert.equal(calls, 1);
+  } finally { globalThis.fetch = originalFetch; resetHttpSafetyForTests(); }
+});

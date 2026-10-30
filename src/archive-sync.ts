@@ -19,6 +19,8 @@ type Stage = 'threads' | 'gaps' | 'media' | 'folders';
 type Pending = Record<Stage, string[]>;
 interface AuditEntry {
   ts: string;
+  operation?: string;
+  category?: string;
   status?: number;
   ok?: boolean;
   errorName?: string;
@@ -31,6 +33,7 @@ interface SyncState {
   pendingConversations?: string[];
   nextBacklogStage?: Stage;
   folderResumeAfterId?: string;
+  lastOvernightStartedAt?: string;
 }
 
 export function backlogCounts(pending: Partial<Pending>) {
@@ -80,14 +83,52 @@ export function availableRequestBudget(entries: AuditEntry[], now: number, runLi
     const age = now - Date.parse(entry.ts);
     return age >= 0 && age < 3_600_000;
   });
-  for (const entry of recent) {
+  for (const entry of entries.filter((entry) => Date.parse(entry.ts) <= now)) {
     if (entry.status !== 429) continue;
-    const reset = Number(entry.responseHeaders?.['x-rate-limit-reset']);
-    const retry = Number(entry.responseHeaders?.['retry-after']);
-    const resumeAt = reset > 0 ? reset * 1000 : Date.parse(entry.ts) + (retry > 0 ? retry * 1000 : 900_000);
+    const resumeAt = requestResumeAt(entry);
     if (resumeAt > now) throw new Error(`X requested a cooldown until ${new Date(resumeAt).toISOString()}.`);
   }
   return Math.max(0, Math.min(runLimit, hourlyLimit - recent.length));
+}
+
+function requestResumeAt(entry: AuditEntry): number {
+  const reset = Number(entry.responseHeaders?.['x-rate-limit-reset']);
+  const rawRetry = entry.responseHeaders?.['retry-after'];
+  const seconds = Number(rawRetry);
+  const retry = rawRetry ? (seconds > 0 ? Date.parse(entry.ts) + seconds * 1000 : Date.parse(rawRetry)) : NaN;
+  const known = [reset > 0 ? reset * 1000 : NaN, retry].filter(Number.isFinite);
+  return known.length ? Math.max(...known) : Date.parse(entry.ts) + 900_000;
+}
+
+export function overnightPolicy(entries: AuditEntry[], now: number, previous: { mode?: string; startedAt?: string; paused?: string } = {}) {
+  const timeZone = 'America/Jamaica';
+  const calendar = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone, hourCycle: 'h23', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    .formatToParts(now);
+  const part = (name: string) => Number(parts.find((item) => item.type === name)?.value);
+  const hour = part('hour');
+  const past = entries.filter((entry) => Number.isFinite(Date.parse(entry.ts)) && Date.parse(entry.ts) <= now);
+  const usedToday = past.filter((entry) => calendar.format(Date.parse(entry.ts)) === calendar.format(now)).length;
+  let reason: string | undefined;
+  if (hour < 1 || hour >= 6) reason = 'Outside the overnight window (01:00-06:00 America/Jamaica)';
+  else if (usedToday >= 240) reason = 'Overnight daily request allowance reached';
+  else if (previous.mode === 'overnight' && previous.startedAt && now - Date.parse(previous.startedAt) < 90 * 60_000) {
+    reason = 'Waiting at least 90 minutes between overnight runs';
+  } else if (/Authentication or access failure|HTTP 401|HTTP 403/i.test(previous.paused ?? '')) {
+    reason = 'Authentication/access requires manual recovery before unattended fetching';
+  }
+  const latest = new Map<string, AuditEntry>();
+  for (const entry of past.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts))) latest.set(`${entry.category}/${entry.operation}`, entry);
+  for (const entry of latest.values()) {
+    const remaining = Number(entry.responseHeaders?.['x-rate-limit-remaining']);
+    if (!reason && Number.isFinite(remaining) && remaining <= 200 && requestResumeAt(entry) > now) {
+      reason = `Waiting for the saved rate-limit reset until ${new Date(requestResumeAt(entry)).toISOString()}`;
+    }
+  }
+  return { timeZone, startHour: 1, endHour: 6, minDelayMs: 10_000, rateLimitFloor: 200,
+    runBudget: 80, hourlyBudget: 120, dailyBudget: 240, usedToday,
+    availableRequests: reason ? 0 : Math.min(80, 240 - usedToday), reason,
+    stopAt: now + ((6 - hour) * 3600 - part('minute') * 60 - part('second')) * 1000 - now % 1000 };
 }
 
 export function acquireSyncLock(directory: string): () => void {
@@ -168,6 +209,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     .option('--no-push', 'Keep changes local; do not commit or push')
     .option('--check', 'Check local prerequisites and request allowance without syncing')
     .option('--backlog-only', 'Process saved queues without fetching the bookmark head or adding historical checks')
+    .option('--overnight', 'Conservative unattended backlog catch-up, 01:00-06:00 Jamaica time only')
     .option('--request-budget <n>', 'Total controlled requests across all stages', positive, 240)
     .option('--hourly-budget <n>', 'Maximum requests including recent saved audit logs', positive, 300)
     .option('--recent-folders <n>', 'Maximum folders to reconcile in X order', positive, 20)
@@ -185,6 +227,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     .option('--firefox-profile-dir <path>', 'Firefox profile');
   program.parse(argv);
   const options = program.opts();
+  if (options.overnight) options.backlogOnly = true;
   if (options.backlogOnly && (options.focusFolder || options.comments)) throw new Error('--backlog-only cannot be combined with --focus-folder or --comments.');
   if (options.comments && !options.focusFolder) throw new Error('--comments requires --focus-folder.');
   const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: options.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
@@ -197,9 +240,22 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
   if (options.push) git(directory, 'remote', 'get-url', 'origin');
   const logs = path.join(directory, 'logs');
   const previousAudit = auditEntries(logs);
-  const allowance = availableRequestBudget(previousAudit, Date.now(), options.requestBudget, options.hourlyBudget);
+  const previousSummary = jsonFile<{ mode?: string; startedAt?: string; paused?: string }>(path.join(directory, 'previews/latest-fetch-summary.json'), {});
+  const unattendedStart = options.overnight
+    ? jsonFile<SyncState>(path.join(logs, 'archive-sync-state.json'), {}).lastOvernightStartedAt : undefined;
+  const overnight = options.overnight ? overnightPolicy(previousAudit, Date.now(), {
+    ...previousSummary, ...(unattendedStart ? { mode: 'overnight', startedAt: unattendedStart } : {}),
+  }) : undefined;
+  const runLimit = overnight ? Math.min(options.requestBudget, overnight.availableRequests) : options.requestBudget;
+  const hourlyLimit = overnight ? Math.min(options.hourlyBudget, overnight.hourlyBudget) : options.hourlyBudget;
+  const allowance = availableRequestBudget(previousAudit, Date.now(), runLimit, hourlyLimit);
   if (options.check) {
-    console.log(JSON.stringify({ directory, branch, availableRequests: allowance, clean: !git(directory, 'status', '--porcelain'), node: process.version }, null, 2));
+    console.log(JSON.stringify({ directory, branch, availableRequests: allowance, clean: !git(directory, 'status', '--porcelain'), node: process.version, overnight }, null, 2));
+    return;
+  }
+  if (overnight && (overnight.reason || allowance === 0)) {
+    console.log(JSON.stringify({ mode: 'overnight', skipped: overnight.reason ?? 'Hourly request allowance reached', overnight }, null, 2));
+    process.exitCode = 2;
     return;
   }
   const release = acquireSyncLock(directory);
@@ -222,15 +278,17 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const pending: Pending = { threads: [], gaps: [], media: [], folders: [], ...saved.pending };
     const backlogBefore = backlogCounts(pending);
     const startedAt = new Date().toISOString();
+    const lastOvernightStartedAt = overnight ? startedAt : saved.lastOvernightStartedAt;
     const runId = startedAt.replace(/[:.]/g, '-');
     const previewDir = path.join(directory, 'previews');
     mkdirSync(previewDir, { recursive: true });
     saveJson(path.join(previewDir, 'pre-fetch-latest.json'), { generatedAt: startedAt, count: beforeIds.size, ids: [...beforeIds] });
-    configureHttpSafety({ auditHttp: true, auditHttpBody: false, minDelayMs: 3000, jitterMs: 750,
-      requestBudget: Math.max(1, allowance), maxRequestsPerHour: options.hourlyBudget, rateLimitFloor: 120 });
+    configureHttpSafety({ auditHttp: true, auditHttpBody: false, minDelayMs: overnight?.minDelayMs ?? 3000, jitterMs: 750,
+      requestBudget: Math.max(1, allowance), maxRequestsPerHour: hourlyLimit, rateLimitFloor: overnight?.rateLimitFloor ?? 120,
+      stopAt: overnight?.stopAt, stopOnBlockedResponse: !!overnight });
     const auth = { browser: options.browser, chromeProfileDirectory: options.chromeProfileDirectory, firefoxProfileDir: options.firefoxProfileDir };
     const stages: Record<string, unknown> = {};
-    const persistState = (): void => saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations, nextBacklogStage, folderResumeAfterId });
+    const persistState = (): void => saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations, nextBacklogStage, folderResumeAfterId, lastOvernightStartedAt });
     let paused: string | undefined = allowance === 0 ? 'hourly request budget reached' : undefined;
     const freshAudit = (): AuditEntry[] => auditEntries(logs).filter((entry) => entry.ts >= startedAt);
     const run = async <T>(name: string, task: () => Promise<T>): Promise<T | undefined> => {
@@ -433,7 +491,8 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       startedAt, generatedAt: new Date().toISOString(), beforeCount: initial.length, afterCount: records.length,
       newCount: records.length - initial.length, batchCount: batch.length, paused: paused ?? null,
       pending, pendingConversations, conversations, focusFolder: options.focusFolder,
-      mode: options.backlogOnly ? 'backlog-only' : 'sync', backlog: { before: backlogBefore, after: backlogCounts(pending) },
+      mode: options.overnight ? 'overnight' : options.backlogOnly ? 'backlog-only' : 'sync', overnight,
+      backlog: { before: backlogBefore, after: backlogCounts(pending) },
       conversationTargets: conversationTargets.map((record) => ({ tweetId: record.tweetId, url: record.url,
         authorHandle: record.authorHandle, text: record.text.slice(0, 240), reportedReplies: record.engagement?.replyCount })),
       timelineCursor, stages, exported, previewPath, threadCoverage: threadCoverageReport(finalRecords), batchThreadCoverage: threadCoverageReport(batch), threadBackfillIds: backfillIds,
@@ -448,7 +507,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         networkErrors: requests.filter((entry) => entry.status == null).length,
         minRemaining: remaining.length ? Math.min(...remaining) : null },
     };
-    saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations, nextBacklogStage, folderResumeAfterId, paused: summary.paused });
+    saveJson(statePath, { startedAt, pending, timelineCursor, pendingConversations, nextBacklogStage, folderResumeAfterId, lastOvernightStartedAt, paused: summary.paused });
     saveJson(path.join(previewDir, 'latest-new-ids-full.json'), { generatedAt: summary.generatedAt, newCount: summary.newCount,
       beforeCount: initial.length, afterCount: records.length, ids: [...batchIds], bookmarks: batch });
     saveJson(path.join(previewDir, 'latest-fetch-summary.json'), summary);

@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'nod
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireSyncLock, archiveSyncMain, availableRequestBudget, backlogCounts, recentFolderBookmarks, renderBatchPreview } from '../src/archive-sync.js';
+import { acquireSyncLock, archiveSyncMain, availableRequestBudget, backlogCounts, overnightPolicy, recentFolderBookmarks, renderBatchPreview } from '../src/archive-sync.js';
 import { HttpSafetyStopError } from '../src/http-safety.js';
 import { selectThreadBackfill, threadCoverageReport, threadCoverageLabel } from '../src/thread-coverage.js';
 import type { BookmarkRecord } from '../src/types.js';
@@ -25,6 +25,54 @@ test('hourly allowance includes prior processes, excludes expired requests and h
   assert.equal(availableRequestBudget([
     { ts: '2026-10-18T19:30:00Z', status: 429 },
   ], now, 20, 30), 20);
+});
+
+test('server cooldowns survive more than one hour and honor the later reset/retry header', () => {
+  assert.throws(() => availableRequestBudget([
+    { ts: '2026-10-18T18:00:00Z', status: 429, responseHeaders: { 'retry-after': '10800' } },
+  ], now, 80, 120), /cooldown/);
+  assert.throws(() => availableRequestBudget([
+    { ts: '2026-10-18T19:00:00Z', status: 429, responseHeaders: {
+      'x-rate-limit-reset': String((now - 60_000) / 1000), 'retry-after': 'Sun, 18 Oct 2026 21:00:00 GMT',
+    } },
+  ], now, 80, 120), /cooldown/);
+  assert.equal(availableRequestBudget([
+    { ts: '2026-10-18T18:00:00Z', status: 429, responseHeaders: { 'retry-after': '3600' } },
+  ], now, 80, 120), 80);
+});
+
+test('overnight policy enforces Jamaica hours, small budgets and a six-AM deadline', () => {
+  const oneAM = Date.parse('2026-10-30T06:00:00Z');
+  const policy = overnightPolicy([], oneAM);
+  assert.equal(policy.reason, undefined);
+  assert.equal(policy.availableRequests, 80);
+  assert.equal(policy.hourlyBudget, 120);
+  assert.equal(policy.dailyBudget, 240);
+  assert.equal(policy.minDelayMs, 10_000);
+  assert.equal(policy.rateLimitFloor, 200);
+  assert.equal(policy.stopAt, Date.parse('2026-10-30T11:00:00Z'));
+  assert.equal(overnightPolicy([], oneAM - 1).availableRequests, 0);
+  assert.equal(overnightPolicy([], Date.parse('2026-10-30T11:00:00Z')).availableRequests, 0);
+});
+
+test('overnight daily count includes other CLI requests but not the preceding Jamaican date', () => {
+  const at = Date.parse('2026-10-30T08:00:00Z');
+  const entries = Array.from({ length: 239 }, () => ({ ts: '2026-10-30T06:00:00Z', status: 200 }));
+  entries.push({ ts: '2026-10-30T04:59:59Z', status: 200 });
+  assert.equal(overnightPolicy(entries, at).availableRequests, 1);
+  entries.push({ ts: '2026-10-30T07:00:00Z', status: 200 });
+  assert.equal(overnightPolicy(entries, at).availableRequests, 0);
+});
+
+test('overnight policy retains run spacing, auth holds and saved rate-floor resets', () => {
+  const at = Date.parse('2026-10-30T08:00:00Z');
+  assert.match(overnightPolicy([], at, { mode: 'overnight', startedAt: '2026-10-30T07:00:00Z' }).reason!, /90 minutes/);
+  assert.equal(overnightPolicy([], at, { mode: 'overnight', startedAt: '2026-10-30T06:00:00Z' }).reason, undefined);
+  assert.match(overnightPolicy([], at, { paused: 'Authentication or access failure' }).reason!, /manual recovery/);
+  assert.match(overnightPolicy([{ ts: '2026-10-30T07:50:00Z', operation: 'Bookmarks', responseHeaders: {
+    'x-rate-limit-remaining': '199', 'x-rate-limit-reset': String((at + 60_000) / 1000),
+  } }], at).reason!, /saved rate-limit reset/);
+  assert.equal(overnightPolicy([{ ts: '2026-10-30T07:00:00Z', responseHeaders: { 'x-rate-limit-remaining': '199' } }], at).reason, undefined);
 });
 
 test('a second sync cannot acquire the same archive lock', () => {
