@@ -214,6 +214,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     .option('--hourly-budget <n>', 'Maximum requests including recent saved audit logs', positive, 300)
     .option('--recent-folders <n>', 'Maximum folders to reconcile in X order', positive, 20)
     .option('--focus-folder <name>', 'Sync and prioritize this folder before the older enrichment backlog')
+    .option('--folder-only', 'Refresh only --focus-folder, without the global feed or unrelated saved queues')
     .option('--thread-backfill <n>', 'Maximum historical thread checks added per run (0 disables), prioritizing Ads, Paywalls and Consumer Apps', (value: string) => {
       if (value === '0') return 0;
       return positive(value);
@@ -229,6 +230,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
   const options = program.opts();
   if (options.overnight) options.backlogOnly = true;
   if (options.backlogOnly && (options.focusFolder || options.comments)) throw new Error('--backlog-only cannot be combined with --focus-folder or --comments.');
+  if (options.folderOnly && !options.focusFolder) throw new Error('--folder-only requires --focus-folder.');
   if (options.comments && !options.focusFolder) throw new Error('--comments requires --focus-folder.');
   const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: options.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
   if (options.dataDir) process.env.FT_DATA_DIR = path.resolve(options.dataDir);
@@ -312,7 +314,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         return undefined;
       }
     };
-    const timeline = options.backlogOnly ? undefined : await run('timeline', () => services.timeline({ ...auth, incremental: true, resumeCursor: timelineCursor, maxPages: 12,
+    const timeline = options.backlogOnly || options.folderOnly ? undefined : await run('timeline', () => services.timeline({ ...auth, incremental: true, resumeCursor: timelineCursor, maxPages: 12,
       delayMs: 3000, maxMinutes: 15, onProgress: (p) => console.log(`[timeline] page ${p.page}: ${p.newAdded} new`) }));
     if (timeline) {
       if (['caught up to newest stored bookmark', 'end of bookmarks', 'no new bookmarks (stale)'].includes(timeline.stopReason)) timelineCursor = undefined;
@@ -333,8 +335,9 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const focusedSnapshot = options.focusFolder ? folderState.folders.find((folder) => folder.name.toLowerCase() === options.focusFolder.toLowerCase()) : undefined;
     if (options.focusFolder && !focusedSnapshot?.orderedRecordIds && !paused) paused = 'Focused folder has no ordered snapshot';
     const focused = options.focusFolder ? recentFolderBookmarks(captured, options.focusFolder, focusedSnapshot?.orderedRecordIds ?? []) : [];
-    const resumableIds = captured.filter((record) => record.threadCapture?.retryable).map((record) => record.id);
-    const backfillIds = options.backlogOnly || backlogBefore.uniqueBookmarks ? []
+    const folderScope = new Set(captured.filter((record) => record.folderNames?.some((name) => name.toLowerCase() === options.focusFolder?.toLowerCase())).map((record) => record.id));
+    const resumableIds = captured.filter((record) => record.threadCapture?.retryable && (!options.folderOnly || folderScope.has(record.id))).map((record) => record.id);
+    const backfillIds = options.backlogOnly || options.folderOnly || backlogBefore.uniqueBookmarks ? []
       : selectThreadBackfill(captured, new Set([...pending.threads, ...focused.map((record) => record.id)]), options.threadBackfill);
     pending.threads = [...new Set([...pending.threads, ...resumableIds, ...backfillIds])];
     const priorityIds = [...new Set([...focused.map((record) => record.id), ...newIds, ...resumableIds])];
@@ -348,10 +351,11 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       }
     }
     const tagged = new Set(captured.filter((record) => record.folderIds?.length).map((record) => record.id));
-    pending.folders = pending.folders.filter((id) => !tagged.has(id));
+    pending.folders = pending.folders.filter((id) => (options.folderOnly && !folderScope.has(id)) || !tagged.has(id));
     persistState();
     const conversations = [];
     for (const tweetId of [...pendingConversations]) {
+      if (options.folderOnly && !captured.some((record) => record.tweetId === tweetId && folderScope.has(record.id))) continue;
       if (paused) break;
       const result = await run(`comments-${tweetId}`, () => services.conversation({ ...auth, tweetId,
         maxPages: options.commentPages, expandBranches: true, branchLimit: options.commentBranches,
@@ -432,7 +436,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     };
     if (options.backlogOnly) {
       while (!paused && await maintainBacklog()) { /* One bounded pass per queued stage/id. */ }
-    } else if (!paused) await maintainBacklog();
+    } else if (!paused && !options.folderOnly) await maintainBacklog();
 
     const attempted = new Set<string>();
     let chunk = 0;
@@ -440,7 +444,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       while (!paused) {
         const queued = new Set([...pending.threads, ...pending.gaps, ...pending.media]);
         const ids = [...new Set([...priorityIds.filter((id) => queued.has(id)), ...pending.media, ...pending.gaps, ...pending.threads])]
-          .filter((id) => !attempted.has(id)).slice(0, 10);
+          .filter((id) => !attempted.has(id) && (!options.folderOnly || folderScope.has(id))).slice(0, 10);
         if (!ids.length) break;
         ids.forEach((id) => attempted.add(id));
         chunk++;
@@ -461,7 +465,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     };
     if (!options.backlogOnly) {
       await enrich();
-      if (!foldersAttempted) await reconcileFolders('folders');
+      if (!foldersAttempted && !options.folderOnly) await reconcileFolders('folders');
     }
     // Folder walks can discover bookmarks absent from the all-bookmarks timeline.
     const records = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
@@ -472,7 +476,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       if (!options.backlogOnly) await enrich();
     }
     const finalRecords = folderOnlyIds.length ? await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath()) : records;
-    const batchIds = new Set([...newIds, ...folderOnlyIds, ...focused.map((record) => record.id), ...backfillIds, ...resumableIds, ...Object.values(saved.pending ?? {}).flat()]);
+    const batchIds = options.folderOnly ? folderScope : new Set([...newIds, ...folderOnlyIds, ...focused.map((record) => record.id), ...backfillIds, ...resumableIds, ...Object.values(saved.pending ?? {}).flat()]);
     const batch = finalRecords.filter((record) => batchIds.has(record.id));
     await buildIndex({ force: true });
     const exported = await exportReadableBookmarkArchive({ clean: true, includeUnfiled: false });
@@ -491,7 +495,8 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       startedAt, generatedAt: new Date().toISOString(), beforeCount: initial.length, afterCount: records.length,
       newCount: records.length - initial.length, batchCount: batch.length, paused: paused ?? null,
       pending, pendingConversations, conversations, focusFolder: options.focusFolder,
-      mode: options.overnight ? 'overnight' : options.backlogOnly ? 'backlog-only' : 'sync', overnight,
+      mode: options.overnight ? 'overnight' : options.backlogOnly ? 'backlog-only' : options.folderOnly ? 'folder-only' : 'sync', overnight,
+      scopePending: options.folderOnly ? Object.fromEntries(Object.entries(pending).map(([stage, ids]) => [stage, ids.filter((id) => folderScope.has(id))])) : undefined,
       backlog: { before: backlogBefore, after: backlogCounts(pending) },
       conversationTargets: conversationTargets.map((record) => ({ tweetId: record.tweetId, url: record.url,
         authorHandle: record.authorHandle, text: record.text.slice(0, 240), reportedReplies: record.engagement?.replyCount })),

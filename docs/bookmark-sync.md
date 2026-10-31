@@ -33,6 +33,7 @@ x-bookmark-sync --backlog-only # Work through saved queues, without fetching the
 x-bookmark-sync --overnight --check # Inspect unattended limits without network requests
 x-bookmark-sync --overnight   # Slow saved-queue catch-up, only 01:00-06:00 Jamaica time
 x-bookmark-sync --focus-folder Ads --comments 3  # Prioritize Ads and archive public conversations
+x-bookmark-sync --focus-folder SEO --folder-only # Fresh SEO folder fetch, without global feed/backlog work
 x-bookmark-sync --help
 ```
 
@@ -45,6 +46,8 @@ Exit codes: **0** completed planned stages, **1** error, **2** partial progress 
 Use `--backlog-only` for an explicitly requested catch-up pass. It rotates batches of up to ten queued IDs per enrichment stage, attempts at most one bounded folder pass, and does not add historical thread checks or fetch the bookmark head. Any unfinished head cursor is preserved for a later ordinary sync. Folder walks can incidentally discover additional bookmarks; those are saved and queued, not discarded. Articles/media discovered after a thread pass stay queued even if those downstream stages already ran. This mode has the same request allowance, spacing, cooldowns, exports and Git publication as ordinary sync; stop at a guardrail rather than repeatedly relaunching it. It cannot be combined with `--focus-folder` or `--comments`.
 
 The summary's `backlog.before` and `backlog.after` report both per-stage counts and **distinct bookmark counts**. One bookmark can need several stages, so adding the stage counts overstates the number of affected bookmarks. This pending inventory is separate from unchecked historical thread coverage.
+
+For a fresh fetch of one folder, use `--focus-folder SEO --folder-only`. This walks the named folder now, prioritizes its ten latest saved bookmarks for enrichment and resumes only saved enrichment belonging to that folder. It does not read the global bookmark feed, seed historical checks, process unrelated conversations or reconcile other folders. Unrelated queues, the global feed cursor and overnight scheduling checkpoints are preserved. The HTML preview contains that folder's archived records; `scopePending` separates its unfinished work from global pending queues. Existing safety limits, cooldowns, exports and Git publication still apply. Markdown and HTML put each tweet's text and article body before its media.
 
 ## Overnight Catch-Up
 

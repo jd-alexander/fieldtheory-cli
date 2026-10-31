@@ -319,6 +319,87 @@ test('focused conversations run before old backlog and include newly discovered 
   });
 });
 
+test('folder-only fetch refreshes the folder without global feed, backlog or unrelated conversations', async () => {
+  await withArchive(async (directory, write) => {
+    const old = { ...record('old'), threadCapture: { status: 'partial' as const, checkedAt: '', retryable: true,
+      parentsComplete: true, detailComplete: false, pagesFetched: 3 } };
+    write([old]);
+    mkdirSync(path.join(directory, 'logs'));
+    const pending = { threads: ['old'], gaps: ['old'], media: ['old'], folders: ['old'] };
+    writeFileSync(path.join(directory, 'logs/archive-sync-state.json'), JSON.stringify({ pending,
+      pendingConversations: ['old'], timelineCursor: 'global-cursor', folderResumeAfterId: 'global-folder',
+      nextBacklogStage: 'folders', lastOvernightStartedAt: '2026-10-31T08:00:00Z' }));
+    execFileSync('git', ['-C', directory, 'add', '-A']);
+    execFileSync('git', ['-C', directory, 'commit', '-m', 'Save unrelated work']);
+    const fresh = { ...record('fresh'), folderIds: ['seo'], folderNames: ['SEO'] };
+    const calls: string[] = [];
+    const unexpected = async (): Promise<never> => { throw new Error('Must not fetch unrelated content'); };
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--focus-folder', 'SEO', '--folder-only'], {
+      timeline: unexpected, conversation: unexpected,
+      folders: async (options) => {
+        assert.equal(options?.onlyFolderName, 'SEO'); calls.push('folder');
+        write([fresh, old]);
+        writeFileSync(path.join(directory, 'bookmark-folders-state.json'), JSON.stringify({ folders: [
+          { id: 'seo', name: 'SEO', orderedRecordIds: ['fresh'] },
+        ] }));
+        return { folders: [], perFolder: [], targetFolderCount: 1, totalAdded: 1, totalTagged: 0,
+          totalUntagged: 0, skippedFolders: [], orphanFoldersCleared: [] };
+      },
+      threads: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['fresh']); calls.push('threads');
+        return { total: 1, contextFilled: 0, belowFilled: 0, emptyChecked: 1, failed: 0, failures: [], completedIds: ['fresh'] };
+      },
+      gaps: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['fresh']); calls.push('gaps');
+        return { total: 1, quotedTweetsFilled: 0, textExpanded: 0, articlesEnriched: 0,
+          bookmarkedAtRepaired: 0, bookmarkedAtMissing: 1, failed: 0, failures: [] };
+      },
+      media: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['fresh']); calls.push('media');
+        return { schemaVersion: 1, generatedAt: '', limit: 1, maxBytes: 10, processed: 0,
+          downloaded: 0, failed: 0, skippedTooLarge: 0, entries: [] };
+      },
+    });
+    assert.deepEqual(calls, ['folder', 'threads', 'gaps', 'media']);
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    const state = JSON.parse(readFileSync(path.join(directory, 'logs/archive-sync-state.json'), 'utf8'));
+    assert.equal(summary.mode, 'folder-only');
+    assert.equal(summary.batchCount, 1);
+    assert.deepEqual(summary.threadBackfillIds, []);
+    assert.deepEqual(summary.scopePending, { threads: [], gaps: [], media: [], folders: [] });
+    assert.deepEqual(state.pending, pending);
+    assert.deepEqual(state.pendingConversations, ['old']);
+    assert.equal(state.timelineCursor, 'global-cursor');
+    assert.equal(state.folderResumeAfterId, 'global-folder');
+    assert.equal(state.nextBacklogStage, 'folders');
+    assert.equal(state.lastOvernightStartedAt, '2026-10-31T08:00:00Z');
+    const preview = readFileSync(summary.previewPath, 'utf8');
+    assert.ok(preview.includes('Post fresh'));
+    assert.ok(!preview.includes('Post old'));
+  });
+});
+
+test('folder-only requires an explicitly named folder', async () => {
+  await assert.rejects(archiveSyncMain(['node', 'x-bookmark-sync', '--folder-only']), /requires --focus-folder/);
+});
+
+test('HTML puts tweet and article text above images for root, quoted and thread posts', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'ft-text-first-'));
+  try {
+    const image = path.join(directory, 'image.jpg'); writeFileSync(image, 'fixture');
+    const bookmark = { ...record('root'), articleText: 'Root article body',
+      quotedTweet: { id: 'quote', url: 'https://x.com/i/status/quote', text: 'Quoted text', articleText: 'Quoted article body' },
+      threadBelow: [{ id: 'reply', url: 'https://x.com/i/status/reply', text: 'Reply text', articleText: 'Reply article body' }] };
+    const entries = ['root', 'quote', 'reply'].map((tweetId) => ({ bookmarkId: 'root', tweetId, tweetUrl: bookmark.url,
+      sourceUrl: 'https://example.org/image.jpg', localPath: image, status: 'downloaded' as const, fetchedAt: '' }));
+    const html = renderBatchPreview([bookmark], entries, directory);
+    for (const section of html.split('<section class="tweet">').slice(1)) {
+      assert.ok(section.indexOf('article body') >= 0);
+      assert.ok(section.indexOf('article body') < section.indexOf('<img'));
+    }
+  } finally { rmSync(directory, { recursive: true }); }
+});
+
 test('a conversation guardrail saves its pending ID and skips older enrichment', async () => {
   await withArchive(async (directory, write) => {
     const focused = { ...record('ad'), folderIds: ['f'], folderNames: ['Ads'], folderSortIndices: ['999'] };

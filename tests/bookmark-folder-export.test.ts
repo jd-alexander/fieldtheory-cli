@@ -238,6 +238,7 @@ test('exportReadableBookmarkArchive renders quoted X Article bodies', async () =
           url: 'https://x.com/quoted/status/quoted-article',
           articleTitle: 'Quoted article title',
           articleText: 'Quoted article body should appear verbatim in the readable markdown file.',
+          media: ['https://example.org/quoted-image.jpg'],
         },
       },
     ];
@@ -257,6 +258,7 @@ test('exportReadableBookmarkArchive renders quoted X Article bodies', async () =
     assert.match(markdown, /### Article/);
     assert.match(markdown, /Quoted article title/);
     assert.match(markdown, /Quoted article body should appear verbatim/);
+    assert.ok(markdown.indexOf('Quoted article body should appear verbatim') < markdown.indexOf('https://example.org/quoted-image.jpg'));
 
     const folderIndex = await readFile(path.join(folderDir, 'README.md'), 'utf8');
     assert.match(folderIndex, /\| yes \|/);
@@ -325,6 +327,8 @@ test('exportReadableBookmarkArchive treats downloaded Twitter quality variants a
     assert.ok(bookmarkFile);
     const content = await readFile(path.join(folderDir, bookmarkFile), 'utf8');
     assert.match(content, /2060416230641881336-local\.jpg/);
+    assert.ok(content.indexOf('Article body') < content.indexOf('## Media'));
+    assert.ok(content.indexOf('Article body') < content.indexOf('![2060416230641881336-local.jpg]'));
     assert.doesNotMatch(content, /Remote media not downloaded yet/);
   });
 });

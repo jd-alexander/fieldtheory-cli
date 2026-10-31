@@ -286,6 +286,7 @@ function renderTweetSnapshot(
   lines.push('');
   lines.push(tweet.text ?? '');
   lines.push('');
+  lines.push(...renderArticleMarkdown('### Article', tweet));
 
   const mediaLines = renderMediaMarkdown(
     filePath,
@@ -296,7 +297,6 @@ function renderTweetSnapshot(
     lines.push(...mediaLines);
     lines.push('');
   }
-  lines.push(...renderArticleMarkdown('### Article', tweet));
   lines.push(`[Original tweet](${tweet.url})`);
   lines.push('');
   return lines;
@@ -321,6 +321,13 @@ function renderBookmarkMarkdown(
   if (record.text) lines.push(record.text);
   lines.push('');
 
+  lines.push(...renderArticleMarkdown('## Article', record));
+  if (record.links?.length) {
+    lines.push('## Links');
+    for (const link of record.links) lines.push(`- ${link}`);
+    lines.push('');
+  }
+
   const mediaLines = renderMediaMarkdown(
     filePath,
     mediaEntriesForTweet(mediaByTweetId, record.tweetId),
@@ -329,14 +336,6 @@ function renderBookmarkMarkdown(
   if (mediaLines.length > 0) {
     lines.push('## Media');
     lines.push(...mediaLines);
-    lines.push('');
-  }
-
-  lines.push(...renderArticleMarkdown('## Article', record));
-
-  if (record.links?.length) {
-    lines.push('## Links');
-    for (const link of record.links) lines.push(`- ${link}`);
     lines.push('');
   }
 
