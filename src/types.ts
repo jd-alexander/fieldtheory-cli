@@ -53,6 +53,7 @@ export interface BookmarkEngagementSnapshot {
 }
 
 export interface TweetArticleSnapshot {
+  linkedResources?: import('./bookmark-enrich.js').LinkedResource[];
   articleTitle?: string | null;
   articleText?: string | null;
   articleSite?: string | null;
@@ -136,6 +137,7 @@ export interface ThreadCaptureState {
 }
 
 export interface BookmarkRecord {
+  linkedResources?: import('./bookmark-enrich.js').LinkedResource[];
   id: string;
   tweetId: string;
   authorHandle?: string;

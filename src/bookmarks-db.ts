@@ -361,6 +361,8 @@ function buildThreadSearchText(context: ThreadTweetSnapshot[] = [], below: Threa
   for (const tweet of [...context, ...below]) {
     if (tweet.text) parts.push(tweet.text);
     for (const link of tweet.links ?? []) parts.push(link);
+    if (tweet.articleText) parts.push(tweet.articleText);
+    for (const resource of tweet.linkedResources ?? []) if (resource.content?.text) parts.push(resource.content.text);
   }
 
   const text = [...new Set(parts)]
@@ -508,11 +510,12 @@ function serializeThreadTweets(values: ThreadTweetSnapshot[] | undefined): strin
 }
 
 function recordThreadSearchText(r: BookmarkRecord, preserved?: PreservedBookmarkFields): string | null {
-  if (r.threadContext !== undefined || r.threadBelow !== undefined) {
-    return buildThreadSearchText(r.threadContext ?? [], r.threadBelow ?? []);
-  }
-  return preserved?.threadText
-    ?? buildThreadSearchTextFromJson(preserved?.threadContextJson, preserved?.threadBelowJson);
+  const linked = [r, ...(r.quotedTweet ? [r.quotedTweet] : [])].flatMap((source) =>
+    (source.linkedResources ?? []).flatMap((entry) => [entry.content?.title, entry.content?.text].filter((text): text is string => Boolean(text))));
+  const base = r.threadContext !== undefined || r.threadBelow !== undefined
+    ? buildThreadSearchText(r.threadContext ?? [], r.threadBelow ?? [])
+    : preserved?.threadText ?? buildThreadSearchTextFromJson(preserved?.threadContextJson, preserved?.threadBelowJson);
+  return [base, ...new Set(linked.filter((text) => !base?.includes(text)))].filter(Boolean).join('\n\n') || null;
 }
 
 function insertRecord(db: Database, r: BookmarkRecord, preserved?: PreservedBookmarkFields): void {

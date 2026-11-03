@@ -315,10 +315,28 @@ class HttpSafetyController {
       && (this.config.auditHttpBody || !response.ok);
     if (shouldCaptureSnippet) {
       try {
-        const text = await response.clone().text();
+        const reader = response.clone().body?.getReader();
+        const chunks: Uint8Array[] = [];
+        let bytes = 0, complete = !reader;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([(async () => {
+            while (reader && bytes < 4096) {
+              const next = await reader.read();
+              if (next.done) { complete = true; break; }
+              const chunk = next.value.slice(0, 4096 - bytes);
+              bytes += chunk.byteLength; chunks.push(chunk);
+            }
+          })(), new Promise<void>((resolve) => { timer = setTimeout(resolve, 1000); })]);
+        } finally {
+          if (timer) clearTimeout(timer);
+          // A cloned stream's cancellation can wait for the original consumer.
+          void reader?.cancel().catch(() => {});
+        }
+        const text = new TextDecoder().decode(Buffer.concat(chunks));
         const redacted = redactText(text);
         responseSnippet = redacted.slice(0, 500);
-        responseSnippetTruncated = redacted.length > responseSnippet.length;
+        responseSnippetTruncated = !complete || redacted.length > responseSnippet.length;
       } catch {
         responseSnippet = '[unavailable]';
       }

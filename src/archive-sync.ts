@@ -13,6 +13,8 @@ import { exportReadableBookmarkArchive } from './bookmark-folder-export.js';
 import { buildIndex } from './bookmarks-db.js';
 import { exportTweetConversationMarkdown } from './tweet-conversation-export.js';
 import type { BookmarkRecord, ThreadTweetSnapshot } from './types.js';
+import { linkedSources } from './linked-resources.js';
+import { linkedResourceHtml } from './linked-resource-render.js';
 import { selectThreadBackfill, threadCoverageLabel, threadCoverageReport } from './thread-coverage.js';
 
 type Stage = 'threads' | 'gaps' | 'media' | 'folders';
@@ -182,9 +184,9 @@ export function renderBatchPreview(records: BookmarkRecord[], entries: MediaFetc
       const url = httpUrl(link);
       return url ? [`<li><a href="${escapeHtml(url)}">${escapeHtml(link)}</a></li>`] : [];
     }).join('');
-    const article = tweet.articleText
+    const article = tweet.articleText && !tweet.linkedResources?.some((entry) => entry.content?.text === tweet.articleText)
       ? `<section><h3>${escapeHtml(tweet.articleTitle ?? 'Article')}</h3><div class="body">${escapeHtml(tweet.articleText)}</div></section>` : '';
-    return `<section class="tweet"><h2>@${escapeHtml(tweet.authorHandle)}</h2><a href="https://x.com/i/status/${escapeHtml(tweetId)}">${escapeHtml(tweetId)}</a><div class="body">${escapeHtml(tweet.text)}</div>${article}${links ? `<ul>${links}</ul>` : ''}<div class="media">${assets}</div></section>`;
+    return `<section class="tweet"><h2>@${escapeHtml(tweet.authorHandle)}</h2><a href="https://x.com/i/status/${escapeHtml(tweetId)}">${escapeHtml(tweetId)}</a><div class="body">${escapeHtml(tweet.text)}</div>${article}${linkedResourceHtml(tweet.linkedResources)}${links ? `<ul>${links}</ul>` : ''}<div class="media">${assets}</div></section>`;
   };
   const body = records.map((record) => `<article><p>${escapeHtml(record.folderNames?.join(' / ') ?? '')}</p><p>${escapeHtml(threadCoverageLabel(record))}</p>
     ${(record.threadContext ?? []).map((tweet) => render(tweet, record.id)).join('')}
@@ -215,6 +217,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     .option('--recent-folders <n>', 'Maximum folders to reconcile in X order', positive, 20)
     .option('--focus-folder <name>', 'Sync and prioritize this folder before the older enrichment backlog')
     .option('--folder-only', 'Refresh only --focus-folder, without the global feed or unrelated saved queues')
+    .option('--enrich-only <tweet-id>', 'Enrich URLs/media for one saved bookmark, without fetching the feed, threads or folders')
     .option('--thread-backfill <n>', 'Maximum historical thread checks added per run (0 disables), prioritizing Ads, Paywalls and Consumer Apps', (value: string) => {
       if (value === '0') return 0;
       return positive(value);
@@ -229,6 +232,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
   program.parse(argv);
   const options = program.opts();
   if (options.overnight) options.backlogOnly = true;
+  if (options.enrichOnly && (options.backlogOnly || options.focusFolder || options.comments || options.folderOnly)) throw new Error('--enrich-only cannot be combined with backlog, folder or conversation modes.');
   if (options.backlogOnly && (options.focusFolder || options.comments)) throw new Error('--backlog-only cannot be combined with --focus-folder or --comments.');
   if (options.folderOnly && !options.focusFolder) throw new Error('--folder-only requires --focus-folder.');
   if (options.comments && !options.focusFolder) throw new Error('--comments requires --focus-folder.');
@@ -268,6 +272,8 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       git(directory, 'merge', '--ff-only', `origin/${branch}`);
     }
     const initial = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
+    const enrichmentTarget = options.enrichOnly ? initial.find((record) => record.id === options.enrichOnly || record.tweetId === options.enrichOnly) : undefined;
+    if (options.enrichOnly && !enrichmentTarget) throw new Error(`Saved bookmark not found: ${options.enrichOnly}`);
     const initialMedia = new Set(jsonFile<{ entries: MediaFetchEntry[] }>(path.join(directory, 'media-manifest.json'), { entries: [] })
       .entries.filter((entry) => entry.status === 'downloaded').map((entry) => entry.localPath));
     const beforeIds = new Set(initial.map((record) => record.id));
@@ -314,7 +320,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
         return undefined;
       }
     };
-    const timeline = options.backlogOnly || options.folderOnly ? undefined : await run('timeline', () => services.timeline({ ...auth, incremental: true, resumeCursor: timelineCursor, maxPages: 12,
+    const timeline = options.backlogOnly || options.folderOnly || options.enrichOnly ? undefined : await run('timeline', () => services.timeline({ ...auth, incremental: true, resumeCursor: timelineCursor, maxPages: 12,
       delayMs: 3000, maxMinutes: 15, onProgress: (p) => console.log(`[timeline] page ${p.page}: ${p.newAdded} new`) }));
     if (timeline) {
       if (['caught up to newest stored bookmark', 'end of bookmarks', 'no new bookmarks (stale)'].includes(timeline.stopReason)) timelineCursor = undefined;
@@ -335,12 +341,14 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     const focusedSnapshot = options.focusFolder ? folderState.folders.find((folder) => folder.name.toLowerCase() === options.focusFolder.toLowerCase()) : undefined;
     if (options.focusFolder && !focusedSnapshot?.orderedRecordIds && !paused) paused = 'Focused folder has no ordered snapshot';
     const focused = options.focusFolder ? recentFolderBookmarks(captured, options.focusFolder, focusedSnapshot?.orderedRecordIds ?? []) : [];
-    const folderScope = new Set(captured.filter((record) => record.folderNames?.some((name) => name.toLowerCase() === options.focusFolder?.toLowerCase())).map((record) => record.id));
-    const resumableIds = captured.filter((record) => record.threadCapture?.retryable && (!options.folderOnly || folderScope.has(record.id))).map((record) => record.id);
-    const backfillIds = options.backlogOnly || options.folderOnly || backlogBefore.uniqueBookmarks ? []
+    const folderScope = enrichmentTarget ? new Set([enrichmentTarget.id]) : new Set(captured.filter((record) => record.folderNames?.some((name) => name.toLowerCase() === options.focusFolder?.toLowerCase())).map((record) => record.id));
+    const scopedMode = options.folderOnly || options.enrichOnly;
+    const resumableIds = options.enrichOnly ? [] : captured.filter((record) => record.threadCapture?.retryable && (!scopedMode || folderScope.has(record.id))).map((record) => record.id);
+    const backfillIds = options.backlogOnly || scopedMode || backlogBefore.uniqueBookmarks ? []
       : selectThreadBackfill(captured, new Set([...pending.threads, ...focused.map((record) => record.id)]), options.threadBackfill);
     pending.threads = [...new Set([...pending.threads, ...resumableIds, ...backfillIds])];
-    const priorityIds = [...new Set([...focused.map((record) => record.id), ...newIds, ...resumableIds])];
+    const priorityIds = [...new Set([...(enrichmentTarget ? [enrichmentTarget.id] : []), ...focused.map((record) => record.id), ...newIds, ...resumableIds])];
+    if (enrichmentTarget) for (const stage of ['gaps', 'media'] as const) pending[stage] = [...new Set([enrichmentTarget.id, ...pending[stage]])];
     const conversationTargets = options.comments ? [...focused].sort((a, b) =>
       (b.engagement?.replyCount ?? 0) - (a.engagement?.replyCount ?? 0)).slice(0, options.comments) : [];
     pendingConversations = [...new Set([...pendingConversations, ...conversationTargets.map((record) => record.tweetId)])];
@@ -351,10 +359,11 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       }
     }
     const tagged = new Set(captured.filter((record) => record.folderIds?.length).map((record) => record.id));
-    pending.folders = pending.folders.filter((id) => (options.folderOnly && !folderScope.has(id)) || !tagged.has(id));
+    pending.folders = pending.folders.filter((id) => (scopedMode && !folderScope.has(id)) || !tagged.has(id));
     persistState();
     const conversations = [];
     for (const tweetId of [...pendingConversations]) {
+      if (options.enrichOnly) continue;
       if (options.folderOnly && !captured.some((record) => record.tweetId === tweetId && folderScope.has(record.id))) continue;
       if (paused) break;
       const result = await run(`comments-${tweetId}`, () => services.conversation({ ...auth, tweetId,
@@ -382,12 +391,14 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
           onProgress: (p) => console.log(`[threads] ${p.done}/${p.total}, ${p.belowFilled} continuation chains`) }));
         if (result) completeStage('threads', result.completedIds ?? ids);
       } else if (stage === 'gaps') {
-        const result = await run(name, () => services.gaps({ ...auth, onlyTweetIds: ids, articleLimit: ids.length, delayMs: 5000,
+        const result = await run(name, () => services.gaps({ ...auth, onlyTweetIds: ids, strictBookmarkIds: true, articleLimit: ids.length, articlesOnly: !!options.enrichOnly, delayMs: 5000,
           onProgress: (p) => console.log(`[gaps] ${p.done}/${p.total}, ${p.articlesEnriched} articles, ${p.failed} misses`) }));
         if (result) {
           gapFailures.push(...result.failures);
           saveJson(path.join(directory, 'gaps-failures.json'), { failures: gapFailures });
-          completeStage('gaps', ids);
+          const pendingIds = new Set(result.pendingIds ?? (result.failures.length ? ids.filter((id) =>
+            result.failures.some((failure) => failure.tweetId === id || !ids.includes(failure.tweetId))) : []));
+          completeStage('gaps', ids.filter((id) => !pendingIds.has(id)));
         }
       } else {
         const result = await run(name, () => services.media({ onlyTweetIds: ids, skipProfileImages: true, mediaQuality: 'large',
@@ -436,7 +447,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     };
     if (options.backlogOnly) {
       while (!paused && await maintainBacklog()) { /* One bounded pass per queued stage/id. */ }
-    } else if (!paused && !options.folderOnly) await maintainBacklog();
+    } else if (!paused && !scopedMode) await maintainBacklog();
 
     const attempted = new Set<string>();
     let chunk = 0;
@@ -444,13 +455,13 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       while (!paused) {
         const queued = new Set([...pending.threads, ...pending.gaps, ...pending.media]);
         const ids = [...new Set([...priorityIds.filter((id) => queued.has(id)), ...pending.media, ...pending.gaps, ...pending.threads])]
-          .filter((id) => !attempted.has(id) && (!options.folderOnly || folderScope.has(id))).slice(0, 10);
+          .filter((id) => !attempted.has(id) && (!scopedMode || folderScope.has(id))).slice(0, 10);
         if (!ids.length) break;
         ids.forEach((id) => attempted.add(id));
         chunk++;
         const selected = (stage: Stage): string[] => pending[stage].filter((id) => ids.includes(id));
         const threadIds = selected('threads');
-        if (threadIds.length) {
+        if (threadIds.length && !options.enrichOnly) {
           await processStage('threads', threadIds, `threads-${chunk}`);
         }
         const gapIds = selected('gaps');
@@ -465,7 +476,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
     };
     if (!options.backlogOnly) {
       await enrich();
-      if (!foldersAttempted && !options.folderOnly) await reconcileFolders('folders');
+      if (!foldersAttempted && !scopedMode) await reconcileFolders('folders');
     }
     // Folder walks can discover bookmarks absent from the all-bookmarks timeline.
     const records = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
@@ -476,7 +487,7 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       if (!options.backlogOnly) await enrich();
     }
     const finalRecords = folderOnlyIds.length ? await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath()) : records;
-    const batchIds = options.folderOnly ? folderScope : new Set([...newIds, ...folderOnlyIds, ...focused.map((record) => record.id), ...backfillIds, ...resumableIds, ...Object.values(saved.pending ?? {}).flat()]);
+    const batchIds = scopedMode ? folderScope : new Set([...newIds, ...folderOnlyIds, ...focused.map((record) => record.id), ...backfillIds, ...resumableIds, ...Object.values(saved.pending ?? {}).flat()]);
     const batch = finalRecords.filter((record) => batchIds.has(record.id));
     await buildIndex({ force: true });
     const exported = await exportReadableBookmarkArchive({ clean: true, includeUnfiled: false });
@@ -495,8 +506,8 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       startedAt, generatedAt: new Date().toISOString(), beforeCount: initial.length, afterCount: records.length,
       newCount: records.length - initial.length, batchCount: batch.length, paused: paused ?? null,
       pending, pendingConversations, conversations, focusFolder: options.focusFolder,
-      mode: options.overnight ? 'overnight' : options.backlogOnly ? 'backlog-only' : options.folderOnly ? 'folder-only' : 'sync', overnight,
-      scopePending: options.folderOnly ? Object.fromEntries(Object.entries(pending).map(([stage, ids]) => [stage, ids.filter((id) => folderScope.has(id))])) : undefined,
+      mode: options.overnight ? 'overnight' : options.enrichOnly ? 'url-enrichment' : options.backlogOnly ? 'backlog-only' : options.folderOnly ? 'folder-only' : 'sync', overnight,
+      scopePending: scopedMode ? Object.fromEntries(Object.entries(pending).map(([stage, ids]) => [stage, ids.filter((id) => folderScope.has(id))])) : undefined,
       backlog: { before: backlogBefore, after: backlogCounts(pending) },
       conversationTargets: conversationTargets.map((record) => ({ tweetId: record.tweetId, url: record.url,
         authorHandle: record.authorHandle, text: record.text.slice(0, 240), reportedReplies: record.engagement?.replyCount })),
@@ -504,6 +515,16 @@ export async function archiveSyncMain(argv = process.argv, overrides: Partial<Ar
       newBookmarkIds: finalRecords.filter((record) => !beforeIds.has(record.id)).map((record) => record.id),
       articlesAdded: finalRecords.filter((record) => record.articleText && !initial.find((old) => old.id === record.id)?.articleText).length,
       mediaAdded: { downloaded: addedMedia.length, videos: addedMedia.filter((entry) => entry.contentType?.startsWith('video/')).length },
+      urlExtraction: (() => {
+        const captures = finalRecords.flatMap((record) => linkedSources(record).flatMap((source) => source.linkedResources ?? []));
+        return { uniqueUrls: new Set(captures.map((entry) => entry.resolvedUrl ?? entry.url)).size,
+          captured: captures.filter((entry) => entry.status === 'captured').length,
+          partial: captures.filter((entry) => entry.status === 'partial').length,
+          failed: captures.filter((entry) => entry.status === 'failed').length,
+          skipped: captures.filter((entry) => entry.status === 'skipped').length,
+          pendingRetries: captures.filter((entry) => entry.nextRetryAt).length,
+          exhaustedRetries: captures.filter((entry) => ['failed', 'partial'].includes(entry.status) && entry.attempts >= 3).length };
+      })(),
       media: { downloaded: batchMedia.filter((entry) => entry.status === 'downloaded').length,
         videos: batchMedia.filter((entry) => entry.status === 'downloaded' && entry.contentType?.startsWith('video/')).length,
         skippedTooLarge: batchMedia.filter((entry) => entry.status === 'skipped_too_large').length,

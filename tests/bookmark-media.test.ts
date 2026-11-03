@@ -21,6 +21,26 @@ async function withMediaDataDir(records: any[], fn: () => Promise<void>): Promis
   }
 }
 
+test('external resource images and videos in quotes use safe redirect handling', async () => {
+  const previous = globalThis.fetch;
+  const image = 'https://example.org/article.png', video = 'https://example.org/demo.mp4';
+  globalThis.fetch = (async (input, init) => new Response(init?.method === 'HEAD' ? null : new Uint8Array([1, 2, 3]), {
+    headers: { 'content-type': String(input).endsWith('mp4') ? 'video/mp4' : 'image/png', 'content-length': '3' },
+  })) as typeof fetch;
+  try {
+    await withMediaDataDir([{ id: 'root', tweetId: 'root', text: 'quote', url: 'https://x.com/a/status/root', syncedAt: '',
+      quotedTweet: { id: 'quote', text: 'article', url: 'https://x.com/b/status/quote', linkedResources: [{
+        url: 'https://example.org/article', status: 'captured', attempts: 1, attemptedAt: '',
+        content: { title: 'Article', text: 'Saved body', images: [image], videos: [video] },
+      }] } }], async () => {
+      const manifest = await fetchBookmarkMediaBatch({ skipProfileImages: true });
+      assert.equal(manifest.downloaded, 2); assert.equal(manifest.failed, 0);
+      assert.deepEqual(manifest.entries.map((entry) => entry.sourceUrl).sort(), [image, video].sort());
+      assert.ok(manifest.entries.every((entry) => entry.tweetId === 'quote'));
+    });
+  } finally { globalThis.fetch = previous; }
+});
+
 test('fetchBookmarkMediaBatch downloads post media from GraphQL mediaObjects shape', async () => {
   const photoUrl = 'https://pbs.twimg.com/media/example.jpg';
   const videoPosterUrl = 'https://pbs.twimg.com/amplify_video_thumb/example.jpg';

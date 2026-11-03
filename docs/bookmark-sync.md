@@ -34,6 +34,7 @@ x-bookmark-sync --overnight --check # Inspect unattended limits without network 
 x-bookmark-sync --overnight   # Slow saved-queue catch-up, only 01:00-06:00 Jamaica time
 x-bookmark-sync --focus-folder Ads --comments 3  # Prioritize Ads and archive public conversations
 x-bookmark-sync --focus-folder SEO --folder-only # Fresh SEO folder fetch, without global feed/backlog work
+x-bookmark-sync --enrich-only 2110162988657180990 # URLs/media for one saved bookmark, without a feed/thread/folder walk
 x-bookmark-sync --help
 ```
 
@@ -48,6 +49,18 @@ Use `--backlog-only` for an explicitly requested catch-up pass. It rotates batch
 The summary's `backlog.before` and `backlog.after` report both per-stage counts and **distinct bookmark counts**. One bookmark can need several stages, so adding the stage counts overstates the number of affected bookmarks. This pending inventory is separate from unchecked historical thread coverage.
 
 For a fresh fetch of one folder, use `--focus-folder SEO --folder-only`. This walks the named folder now, prioritizes its ten latest saved bookmarks for enrichment and resumes only saved enrichment belonging to that folder. It does not read the global bookmark feed, seed historical checks, process unrelated conversations or reconcile other folders. Unrelated queues, the global feed cursor and overnight scheduling checkpoints are preserved. The HTML preview contains that folder's archived records; `scopePending` separates its unfinished work from global pending queues. Existing safety limits, cooldowns, exports and Git publication still apply. Markdown and HTML put each tweet's text and article body before its media.
+
+## Linked URL Extraction
+
+Every queued gap pass examines URLs in the bookmark, quoted tweet, parents and saved same-author continuations, including links in long posts. Each source keeps a `linkedResources` array in canonical JSONL: original/resolved URL, title, body/Markdown, outbound links, image/video URLs, status, attempts, failure reason and next retry time. Several URLs can be saved per tweet without replacing the first article with the last. Captured content is reused across records; page links are recorded but not recursively crawled.
+
+HTML uses [Mozilla Readability](https://github.com/mozilla/readability) and [Turndown](https://github.com/mixmark-io/turndown) for structured Markdown. Article images/native videos enter the existing capped media queue and local previews. Markdown/plain text and JSON are supported directly. GitHub repository links fetch the default-branch `README.md`, blob links fetch the raw file, and public Gists capture up to ten files. PDFs use [unpdf/PDF.js](https://github.com/unjs/unpdf) in a local worker with a 15-second parser timeout, 128-MiB worker heap and 100-page limit. Scanned PDFs need OCR; this path does not claim PDF-image extraction or downloading every embedded video provider.
+
+Shortlinks try HEAD, then bounded GET/HTML-refresh or canonical-URL fallback. Every redirect, adapter and media request shares the controller and redacted audit log. No X cookies are sent to external sites, scripts are not executed and private/local network destinations are rejected, including DNS answers at connection time. Fetches time out after 30 seconds; response bodies are capped at 2 MiB (10 MiB for PDF), extracted text at 250,000 characters, article images at 40 and native videos at ten. Direct image/video URLs become media targets. Truncated/preview-only captures and extraction failures are explicit. JavaScript-only pages, login walls, paywalls and unavailable sites can still require attention; no bypass is attempted.
+
+At most six URLs per bookmark are attempted in one pass; unattempted URLs remain queued. Failed/partial captures retry after six hours, then 24 hours, up to three attempts total. Successful URLs are not fetched again because another URL failed. After the third failure, the result remains visible in JSONL/exports and `urlExtraction.exhaustedRetries`, but automatic retries stop. Guardrail interruptions preserve completed URLs without consuming an extraction retry. The overnight job processes these saved gaps without raising its request/time limits.
+
+Use `--enrich-only <saved-tweet-id>` for targeted recovery: URLs and media for that bookmark only, preserving unrelated queues, folder/head cursors, pending conversations and the unattended-start timestamp. It rebuilds exports and commits/pushes normally. It does not fetch the bookmark head, walk folders, expand threads or seed historical checks. An unfinished thread can remain queued when its article succeeds. `scopePending` and the preview refer to the selected bookmark; global pending counts describe the whole archive.
 
 ## Overnight Catch-Up
 

@@ -5,6 +5,7 @@ import { ensureDir, pathExists, readJson, readJsonLines, writeJson } from './fs.
 import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksCachePath } from './paths.js';
 import type { BookmarkMediaObject, BookmarkRecord, ThreadTweetSnapshot } from './types.js';
 import { controlledFetch, isHttpSafetyStop } from './http-safety.js';
+import { fetchFollowingRedirects, type LinkedResource } from './bookmark-enrich.js';
 
 export const DEFAULT_MEDIA_MAX_BYTES = 200 * 1024 * 1024;
 export const MEDIA_QUALITY_VALUES = ['medium', 'large', '4096x4096', 'orig'] as const;
@@ -50,6 +51,7 @@ export interface MediaFetchProgress {
 }
 
 interface MediaFetchTarget {
+  externalResource?: boolean;
   bookmarkId: string;
   tweetId: string;
   tweetUrl: string;
@@ -60,6 +62,7 @@ interface MediaFetchTarget {
 }
 
 interface MediaTargetSource {
+  linkedResources?: LinkedResource[];
   tweetId: string;
   tweetUrl: string;
   authorHandle?: string;
@@ -140,12 +143,13 @@ async function loadManifest(): Promise<MediaFetchManifest | null> {
   return readJson<MediaFetchManifest>(manifestPath);
 }
 
-function hasArticleMediaTargets(source: { articleCoverMedia?: unknown; articleMediaEntities?: unknown[] } | undefined): boolean {
+function hasArticleMediaTargets(source: { articleCoverMedia?: unknown; articleMediaEntities?: unknown[]; linkedResources?: LinkedResource[] } | undefined): boolean {
   if (!source) return false;
-  return Boolean(extractArticleMediaUrl(source.articleCoverMedia)) || (source.articleMediaEntities ?? []).some((entity) => Boolean(extractArticleMediaUrl(entity)));
+  return Boolean(extractArticleMediaUrl(source.articleCoverMedia)) || (source.articleMediaEntities ?? []).some((entity) => Boolean(extractArticleMediaUrl(entity)))
+    || (source.linkedResources ?? []).some((entry) => Boolean(entry.content?.images?.length || entry.content?.videos?.length));
 }
 
-function hasTargets(source: { media?: unknown[]; mediaObjects?: unknown[]; authorProfileImageUrl?: string; articleCoverMedia?: unknown; articleMediaEntities?: unknown[] } | undefined): boolean {
+function hasTargets(source: { media?: unknown[]; mediaObjects?: unknown[]; authorProfileImageUrl?: string; articleCoverMedia?: unknown; articleMediaEntities?: unknown[]; linkedResources?: LinkedResource[] } | undefined): boolean {
   if (!source) return false;
   return (source.media?.length ?? 0) > 0 ||
     (source.mediaObjects?.length ?? 0) > 0 ||
@@ -221,6 +225,11 @@ function appendMediaTargets(
   for (const mediaUrl of articleMediaUrls) {
     pushTarget(targets, seenKeys, base, mediaUrl ? applyPhotoMediaQuality(mediaUrl, mediaQuality) : undefined, false);
   }
+  for (const resource of source.linkedResources ?? []) {
+    for (const mediaUrl of [...(resource.content?.images ?? []), ...(resource.content?.videos ?? [])]) {
+      pushTarget(targets, seenKeys, { ...base, externalResource: true }, mediaUrl, false);
+    }
+  }
 
   if (source.authorProfileImageUrl && !skipProfileImages) {
     const fullUrl = source.authorProfileImageUrl.replace('_normal.', '_400x400.');
@@ -249,6 +258,7 @@ function resolveMediaTargets(
     mediaObjects: bookmark.mediaObjects,
     articleCoverMedia: bookmark.articleCoverMedia,
     articleMediaEntities: bookmark.articleMediaEntities,
+    linkedResources: bookmark.linkedResources,
   }, downloadedProfileImageUrls, skipProfileImages, mediaQuality);
 
   if (bookmark.quotedTweet) {
@@ -262,6 +272,7 @@ function resolveMediaTargets(
       mediaObjects: bookmark.quotedTweet.mediaObjects,
       articleCoverMedia: bookmark.quotedTweet.articleCoverMedia,
       articleMediaEntities: bookmark.quotedTweet.articleMediaEntities,
+      linkedResources: bookmark.quotedTweet.linkedResources,
     }, downloadedProfileImageUrls, skipProfileImages, mediaQuality);
   }
 
@@ -276,6 +287,7 @@ function resolveMediaTargets(
       mediaObjects: tweet.mediaObjects,
       articleCoverMedia: tweet.articleCoverMedia,
       articleMediaEntities: tweet.articleMediaEntities,
+      linkedResources: tweet.linkedResources,
     }, downloadedProfileImageUrls, skipProfileImages, mediaQuality);
   };
 
@@ -465,11 +477,15 @@ export async function fetchBookmarkMediaBatch(
       const fetchedAt = new Date().toISOString();
 
       try {
-        const head = await controlledFetch(sourceUrl, { method: 'HEAD' }, {
-          operation: 'BookmarkMediaHead',
-          category: 'media',
-          tweetId,
-        });
+        const fetchMedia = async (method: 'HEAD' | 'GET'): Promise<Response> => {
+          if (!target.externalResource) return controlledFetch(sourceUrl, { method }, {
+            operation: method === 'HEAD' ? 'BookmarkMediaHead' : 'BookmarkMediaGet', category: 'media', tweetId });
+          const result = await fetchFollowingRedirects(sourceUrl, { method, signal: AbortSignal.timeout(30_000),
+            metadata: { operation: method === 'HEAD' ? 'BookmarkMediaHead' : 'BookmarkMediaGet', category: 'media', tweetId } });
+          if (!result) throw new Error('unsafe external media URL');
+          return result.response;
+        };
+        const head = await fetchMedia('HEAD');
         const contentLengthHeader = head.headers.get('content-length');
         const contentType = head.headers.get('content-type') ?? undefined;
         const declaredBytes = contentLengthHeader ? Number(contentLengthHeader) : undefined;
@@ -504,11 +520,7 @@ export async function fetchBookmarkMediaBatch(
           continue;
         }
 
-        const response = await controlledFetch(sourceUrl, undefined, {
-          operation: 'BookmarkMediaGet',
-          category: 'media',
-          tweetId,
-        });
+        const response = await fetchMedia('GET');
         if (!response.ok) {
           const entry = {
             bookmarkId,
@@ -532,9 +544,25 @@ export async function fetchBookmarkMediaBatch(
           emitProgress(sourceUrl);
           continue;
         }
+        if (target.externalResource && !/^(image|video)\//.test(response.headers.get('content-type') ?? '')) {
+          await response.body?.cancel();
+          throw new Error('External media URL did not return an image or video');
+        }
 
-        const buffer = Buffer.from(await response.arrayBuffer());
-        if (buffer.byteLength > maxBytes) {
+        const chunks: Uint8Array[] = [];
+        let received = 0;
+        const reader = response.body?.getReader();
+        if (reader) {
+          while (true) {
+            const next = await reader.read();
+            if (next.done) break;
+            received += next.value.byteLength;
+            if (received > maxBytes) { await reader.cancel(); break; }
+            chunks.push(next.value);
+          }
+        }
+        const buffer = Buffer.concat(chunks);
+        if (received > maxBytes) {
           const entry = {
             bookmarkId,
             tweetId,
@@ -543,9 +571,9 @@ export async function fetchBookmarkMediaBatch(
             authorName,
             sourceUrl,
             contentType: response.headers.get('content-type') ?? contentType ?? undefined,
-            bytes: buffer.byteLength,
+            bytes: received,
             status: 'skipped_too_large',
-            reason: `downloaded size ${buffer.byteLength} exceeds max ${maxBytes}`,
+            reason: `downloaded size ${received} exceeds max ${maxBytes}`,
             fetchedAt,
           } satisfies MediaFetchEntry;
           upsertEntry(entry);

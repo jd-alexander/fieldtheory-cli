@@ -20,6 +20,7 @@ import { exportBookmarksForSyncSeed, updateQuotedTweets, updateBookmarkText, upd
 import type { ArticleUpdate } from './bookmarks-db.js';
 import { fetchArticle, resolveTcoLink } from './bookmark-enrich.js';
 import type { ArticleContent } from './bookmark-enrich.js';
+import { captureLinkedResources, hasPendingResources } from './linked-resources.js';
 import { controlledFetch, isHttpSafetyStop } from './http-safety.js';
 import {
   compareThreadTweetsChronologically,
@@ -622,6 +623,10 @@ export function mergeBookmarkRecord(existing: BookmarkRecord | undefined, incomi
   }
   if (existing.enrichedAt && !incoming.enrichedAt) {
     merged.enrichedAt = existing.enrichedAt;
+  }
+  if (existing.linkedResources && !incoming.linkedResources) merged.linkedResources = existing.linkedResources;
+  if (existing.quotedTweet?.linkedResources && merged.quotedTweet?.id === existing.quotedTweet.id && !merged.quotedTweet.linkedResources) {
+    merged.quotedTweet = { ...merged.quotedTweet, linkedResources: existing.quotedTweet.linkedResources };
   }
   if (existing.threadContext && incoming.threadContext === undefined) {
     merged.threadContext = existing.threadContext;
@@ -2465,7 +2470,6 @@ async function fetchThreadTweetViaSyndication(tweetId: string): Promise<{ tweet:
 
 // Text >= 275 chars may be truncated by Twitter's legacy.full_text limit
 const TRUNCATION_THRESHOLD = 275;
-const LINK_ONLY_THRESHOLD = 80;
 
 const GAP_FILL_FAILURE_REASONS: Record<string, string> = {
   empty: 'tweet exists but has no text content',
@@ -2631,8 +2635,12 @@ async function expandThreadForRecord(
     nextParentId: record.inReplyToStatusId, detailTweets: [], parentIds: [], seenCursors: [],
   };
   const context = [...(record.threadContext ?? [])];
-  const mergeTweets = (old: ThreadTweetSnapshot[], added: ThreadTweetSnapshot[]) =>
-    [...new Map([...old, ...added].map((tweet) => [tweet.id, tweet])).values()].sort(compareThreadTweetsChronologically);
+  const mergeTweets = (old: ThreadTweetSnapshot[], added: ThreadTweetSnapshot[]) => {
+    const previous = new Map(old.map((tweet) => [tweet.id, tweet]));
+    return [...new Map([...old, ...added.map((tweet) => ({ ...previous.get(tweet.id), ...tweet,
+      linkedResources: tweet.linkedResources ?? previous.get(tweet.id)?.linkedResources }))].map((tweet) => [tweet.id, tweet])).values()]
+      .sort(compareThreadTweetsChronologically);
+  };
   let below = [...(record.threadBelow ?? [])];
   const save = async (): Promise<void> => {
     capture.checkedAt = new Date().toISOString();
@@ -2898,6 +2906,8 @@ export interface GapFillResult {
   failed: number;
   failures: GapFillFailure[];
   total: number;
+  /** Parent bookmark IDs still needing URL work, including deferred retries. */
+  pendingIds?: string[];
 }
 
 type TweetFetcher = (tweetId: string) => Promise<TweetFetchResult>;
@@ -2924,7 +2934,7 @@ export interface SyncGapsOptions {
   articleFetcher?: (url: string) => Promise<ArticleContent | null>;
   /** Injected t.co resolver, used by tests. Production uses resolveTcoLink. */
   tcoResolver?: (url: string) => Promise<string | null>;
-  /** Cap on ordinary external article fetches. Default: no cap. */
+  /** Cap on parent bookmarks processed for external URLs. Each pass attempts at most six URLs per bookmark. */
   articleLimit?: number;
   /** Only run article enrichment gaps; skip quoted tweet and long-text expansion work. */
   articlesOnly?: boolean;
@@ -2934,6 +2944,8 @@ export interface SyncGapsOptions {
    * immediately without walking the entire historical archive.
    */
   onlyTweetIds?: string[];
+  /** Archive stages pass parent record IDs, not IDs of quotes in unrelated records. */
+  strictBookmarkIds?: boolean;
 }
 
 function resolveGapFillCookies(options: SyncGapsOptions): { csrfToken?: string; cookieHeader?: string } {
@@ -2958,10 +2970,6 @@ function resolveGapFillCookies(options: SyncGapsOptions): { csrfToken?: string; 
   }
 }
 
-function textWithoutUrls(text: string): string {
-  return text.replace(/\b(?:https?:\/\/)?(?:www\.)?[\w.-]+\.[a-z]{2,}\/\S+/gi, '').trim();
-}
-
 function urlsFromText(text?: string | null): string[] {
   const matches = text?.match(/\b(?:https?:\/\/)?(?:www\.)?[\w.-]+\.[a-z]{2,}\/[^\s<>)\]]+/gi) ?? [];
   return matches.map((value) => value.startsWith('http://') || value.startsWith('https://') ? value : `https://${value}`);
@@ -2981,11 +2989,6 @@ function hasFullArticle(record: BookmarkRecord): boolean {
 
 function hasFullTweetSnapshotArticle(tweet: QuotedTweetSnapshot | ThreadTweetSnapshot): boolean {
   return (tweet.articleText?.trim().length ?? 0) >= 50;
-}
-
-function isLinkOnlyBookmark(record: BookmarkRecord): boolean {
-  if (recordLinkUrls(record).length === 0) return false;
-  return textWithoutUrls(record.text ?? '').length < LINK_ONLY_THRESHOLD;
 }
 
 function isXArticleUrl(value: string): boolean {
@@ -3016,8 +3019,8 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
     if (scopedIds.size === 0) return true;
     return scopedIds.has(record.id)
       || scopedIds.has(record.tweetId)
-      || Boolean(record.quotedStatusId && scopedIds.has(record.quotedStatusId))
-      || Boolean(record.quotedTweet?.id && scopedIds.has(record.quotedTweet.id));
+      || (!options.strictBookmarkIds && (Boolean(record.quotedStatusId && scopedIds.has(record.quotedStatusId))
+      || Boolean(record.quotedTweet?.id && scopedIds.has(record.quotedTweet.id))));
   };
   const scopedRecords = records.filter(inScope);
 
@@ -3249,38 +3252,38 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
   // Final persist (gaps 1+2)
   await persistGapProgress();
 
-  // ── Gap 3b: Article enrichment for ordinary link-only bookmarks ─────────
-  // Bookmarks with < 80 chars of text after stripping URLs are "link-only"
-  // and invisible to search. Fetch the linked article to make them searchable.
-  // Article content is stored in JSONL as well as SQLite because JSONL is the
-  // source for the readable folder archive.
+  // Capture every external URL in the root, quote and visible thread snapshots,
+  // retaining per-URL content, failure state and delayed retry checkpoints in JSONL.
 
-  // Filter to link-only bookmarks not yet enriched
-  const needsEnrichment = scopedRecords.filter((r) => {
-    if (hasFullArticle(r)) return false;
-    if (recordHasXArticleUrl(r)) return false;
-    return isLinkOnlyBookmark(r);
-  });
+  const needsEnrichment = scopedRecords.filter(hasPendingResources);
 
   const articleLimit = typeof options.articleLimit === 'number' && Number.isFinite(options.articleLimit)
     ? Math.max(0, Math.floor(options.articleLimit))
     : Infinity;
   const articleTotal = Math.min(needsEnrichment.length, articleLimit);
+  const urlCache = new Map<string, Promise<ArticleContent | null>>();
+  for (const record of records) for (const source of [record, ...(record.quotedTweet ? [record.quotedTweet] : []), ...(record.threadContext ?? []), ...(record.threadBelow ?? [])]) {
+    for (const capture of source.linkedResources ?? []) if (capture.status === 'captured' && capture.content) {
+      for (const url of [capture.url, capture.resolvedUrl, capture.content.url]) if (url) urlCache.set(url, Promise.resolve(capture.content));
+    }
+  }
   for (let i = 0; i < articleTotal; i++) {
     const record = needsEnrichment[i];
-    const originalLinks = record.links ?? [];
-    const links = recordLinkUrls(record);
-    let targetUrl: string | null = null;
+    const hadArticle = Boolean(record.articleText);
     try {
-      for (const link of links) {
-        const resolved = link.includes('t.co/') ? await tcoResolver(link) : link;
-        if (!resolved) continue;
-        if (resolved !== link) {
-          record.links = uniqueStrings([...(record.links ?? []), resolved]);
-        }
-        targetUrl = resolved;
-        break;
-      }
+      const result = await captureLinkedResources(record, { articleFetcher, tcoResolver, cache: urlCache,
+        checkpoint: async () => { await writeJsonLines(cachePath, records); } });
+      articlesEnriched += result.enriched;
+      failed += result.failures.length;
+      failures.push(...result.failures);
+      dbTextUpdates.push({ id: record.id, text: record.text, links: record.links });
+      if (!hadArticle && record.articleText) articleDbUpdates.push(articleUpdate(record.id, {
+        title: record.articleTitle ?? '', text: record.articleText, siteName: record.articleSite ?? undefined,
+        mediaEntities: record.articleMediaEntities, coverMedia: record.articleCoverMedia,
+      }));
+      if (record.quotedTweet) dbQuotedUpdates.push({ id: record.id, quotedTweet: record.quotedTweet });
+      if (record.threadContext || record.threadBelow) await updateThreadData([record]);
+      await persistGapProgress();
     } catch (err) {
       if (isHttpSafetyStop(err)) {
         await persistGapProgress();
@@ -3289,49 +3292,8 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
       failed++;
       failures.push({
         tweetId: record.tweetId,
-        reason: (err as Error).message ?? 'link target resolution failed',
-        url: links[0] ?? record.url,
-      });
-    }
-
-    if ((record.links ?? originalLinks).length !== originalLinks.length) {
-      dbTextUpdates.push({ id: record.id, text: record.text, links: record.links });
-    }
-
-    if (targetUrl) {
-      try {
-        const article = await articleFetcher(targetUrl);
-        if (article && article.text.length >= 50) {
-          const now = new Date().toISOString();
-          applyArticleToRecord(record, article, now);
-          articleDbUpdates.push(articleUpdate(record.id, article));
-          articlesEnriched++;
-        } else {
-          failed++;
-          failures.push({
-            tweetId: record.tweetId,
-            reason: 'no article text extracted',
-            url: targetUrl,
-          });
-        }
-      } catch (err) {
-        if (isHttpSafetyStop(err)) {
-          await persistGapProgress();
-          throw err;
-        }
-        failed++;
-        failures.push({
-          tweetId: record.tweetId,
-          reason: (err as Error).message ?? 'article fetch failed',
-          url: targetUrl,
-        });
-      }
-    } else if (links.length > 0) {
-      failed++;
-      failures.push({
-        tweetId: record.tweetId,
-        reason: 'link target could not be resolved',
-        url: links[0],
+        reason: (err as Error).message ?? 'URL extraction failed',
+        url: record.url,
       });
     }
 
@@ -3344,10 +3306,8 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
       failed,
     });
 
-    // Rate limit: 500ms between fetches
-    if (i < articleTotal - 1) {
-      await new Promise((r) => setTimeout(r, 500));
-    }
+    // URL requests also use the shared request controller's spacing and budgets.
+    if (i < articleTotal - 1 && delayMs) await new Promise((r) => setTimeout(r, delayMs));
   }
 
   await persistGapProgress();
@@ -3361,5 +3321,10 @@ export async function syncGaps(options: SyncGapsOptions = {}): Promise<GapFillRe
     failed,
     failures,
     total: allFetchIds.length + articleTotal,
+    pendingIds: scopedRecords.filter((record) => hasPendingResources(record)
+      || (recordHasXArticleUrl(record) && !hasFullArticle(record))
+      || Boolean(record.quotedTweet && tweetSnapshotHasXArticleUrl(record.quotedTweet) && !hasFullTweetSnapshotArticle(record.quotedTweet))
+      || Boolean(record.quotedStatusId && !record.quotedTweet && !record.quotedTweetFailedAt)
+      || Boolean(maybeTruncated.includes(record) && !record.textExpandedAt)).map((record) => record.id),
   };
 }

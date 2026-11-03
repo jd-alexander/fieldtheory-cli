@@ -20,6 +20,8 @@ import { slug } from './md.js';
 import type { BookmarkMediaObject, BookmarkRecord, QuotedTweetSnapshot, ThreadTweetSnapshot } from './types.js';
 import type { MediaFetchEntry, MediaFetchManifest } from './bookmark-media.js';
 import { threadCoverageLabel } from './thread-coverage.js';
+import type { LinkedResource } from './bookmark-enrich.js';
+import { linkedResourceMarkdown } from './linked-resource-render.js';
 
 interface FolderStateEntry {
   id: string;
@@ -175,12 +177,14 @@ function remoteMediaUrls(source: {
   mediaObjects?: BookmarkMediaObject[];
   articleCoverMedia?: unknown;
   articleMediaEntities?: unknown[];
+  linkedResources?: LinkedResource[];
 }): string[] {
   return [
     ...(source.media ?? []),
     ...mediaUrlsFromObjects(source.mediaObjects),
     extractArticleMediaUrl(source.articleCoverMedia),
     ...(source.articleMediaEntities ?? []).map(extractArticleMediaUrl),
+    ...(source.linkedResources ?? []).flatMap((entry) => [...(entry.content?.images ?? []), ...(entry.content?.videos ?? [])]),
   ].filter((value): value is string => Boolean(value));
 }
 
@@ -222,17 +226,19 @@ function renderMediaMarkdown(
 }
 
 function hasArticleContent(source: {
+  linkedResources?: LinkedResource[];
   articleText?: string | null;
   articleTitle?: string | null;
   articlePreviewText?: string | null;
   articleSummaryText?: string | null;
 }): boolean {
-  return Boolean(source.articleText || source.articleTitle || source.articlePreviewText || source.articleSummaryText);
+  return Boolean(source.linkedResources?.length || source.articleText || source.articleTitle || source.articlePreviewText || source.articleSummaryText);
 }
 
 function renderArticleMarkdown(
   heading: string,
   source: {
+    linkedResources?: LinkedResource[];
     articleTitle?: string | null;
     articleText?: string | null;
     articleSite?: string | null;
@@ -245,6 +251,10 @@ function renderArticleMarkdown(
   if (!hasArticleContent(source)) return [];
   const lines: string[] = [];
   lines.push(heading);
+  if (source.linkedResources?.some((entry) => entry.content?.text === source.articleText) || !source.articleText) {
+    lines.push(...linkedResourceMarkdown(source.linkedResources));
+    if (source.linkedResources?.length) return lines;
+  }
   if (source.articleTitle) {
     lines.push(`### ${oneLine(source.articleTitle)}`);
     lines.push('');
@@ -257,6 +267,7 @@ function renderArticleMarkdown(
   else if (source.articleSummaryText) lines.push(source.articleSummaryText.trim());
   else if (source.articlePreviewText) lines.push(source.articlePreviewText.trim());
   lines.push('');
+  lines.push(...linkedResourceMarkdown(source.linkedResources));
   return lines;
 }
 

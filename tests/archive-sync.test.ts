@@ -9,6 +9,36 @@ import { HttpSafetyStopError } from '../src/http-safety.js';
 import { selectThreadBackfill, threadCoverageReport, threadCoverageLabel } from '../src/thread-coverage.js';
 import type { BookmarkRecord } from '../src/types.js';
 
+test('targeted URL enrichment preserves unrelated queues, cursors and conversations without reading X feeds', async () => {
+  await withArchive(async (directory, write) => {
+    const target = record('target'), unrelated = record('unrelated'); write([target, unrelated]);
+    mkdirSync(path.join(directory, 'logs'), { recursive: true });
+    const state = { pending: { threads: ['target', 'unrelated'], gaps: ['unrelated'], media: ['unrelated'], folders: ['unrelated'] },
+      pendingConversations: ['unrelated'], timelineCursor: 'saved-head', folderResumeAfterId: 'saved-folder',
+      nextBacklogStage: 'folders', lastOvernightStartedAt: '2026-11-03T10:00:00Z' };
+    writeFileSync(path.join(directory, 'logs/archive-sync-state.json'), JSON.stringify(state));
+    execFileSync('git', ['-C', directory, 'add', '-A']); execFileSync('git', ['-C', directory, 'commit', '-m', 'Queue fixture']);
+    const forbidden = async () => { throw new Error('Unrelated work must not run'); };
+    await archiveSyncMain(['node', 'x-bookmark-sync', '--no-push', '--enrich-only', 'target'], {
+      timeline: forbidden, threads: forbidden, folders: forbidden, conversation: forbidden,
+      gaps: async (options) => {
+        assert.deepEqual(options?.onlyTweetIds, ['target']); assert.equal(options?.articlesOnly, true);
+        return { total: 1, quotedTweetsFilled: 0, textExpanded: 0, articlesEnriched: 0, bookmarkedAtRepaired: 0, bookmarkedAtMissing: 0,
+          failed: 1, failures: [{ tweetId: 'target', reason: 'HTTP 503', url: 'https://example.org/fails' }], pendingIds: ['target'] };
+      },
+      media: async () => ({ schemaVersion: 1, generatedAt: '', limit: 1, maxBytes: 1, processed: 0, downloaded: 0, skippedTooLarge: 0, failed: 0, entries: [] }),
+    });
+    const saved = JSON.parse(readFileSync(path.join(directory, 'logs/archive-sync-state.json'), 'utf8'));
+    assert.deepEqual(saved.pending.threads, state.pending.threads); assert.deepEqual(saved.pending.folders, state.pending.folders);
+    assert.deepEqual(saved.pendingConversations, state.pendingConversations); assert.equal(saved.timelineCursor, 'saved-head');
+    assert.equal(saved.folderResumeAfterId, 'saved-folder'); assert.equal(saved.nextBacklogStage, 'folders');
+    assert.equal(saved.lastOvernightStartedAt, state.lastOvernightStartedAt); assert.ok(saved.pending.gaps.includes('target'));
+    const summary = JSON.parse(readFileSync(path.join(directory, 'previews/latest-fetch-summary.json'), 'utf8'));
+    assert.equal(summary.mode, 'url-enrichment'); assert.equal(summary.batchCount, 1);
+    assert.ok(readFileSync(path.join(directory, 'previews/latest-batch.html'), 'utf8').includes('Post target'));
+  });
+});
+
 const now = Date.parse('2026-10-18T20:00:00Z');
 
 test('hourly allowance includes prior processes, excludes expired requests and honors 429 reset', () => {

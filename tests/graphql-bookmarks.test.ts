@@ -947,6 +947,27 @@ test('syncGaps: persists ordinary link-only article content into JSONL', async (
   }, [linkArticle]);
 });
 
+test('syncGaps: captures quote/thread URLs, keeps failures queued, and indexes their bodies', async () => {
+  const target: BookmarkRecord = { id: 'urls-root', tweetId: 'urls-root', url: 'https://x.com/a/status/urls-root',
+    text: 'Long context '.repeat(40), textExpandedAt: NOW, syncedAt: NOW, links: ['https://example.org/one', 'https://example.org/fails'],
+    quotedTweet: { id: 'urls-quote', url: 'https://x.com/b/status/urls-quote', text: '', links: ['https://example.org/quote'] },
+    threadBelow: [{ id: 'urls-reply', url: 'https://x.com/a/status/urls-reply', text: 'https://example.org/reply' }] };
+  await withIsolatedGapFillDataDir(async () => {
+    await buildIndex();
+    const result = await syncGaps({ delayMs: 0, strictBookmarkIds: true, onlyTweetIds: ['urls-root'],
+      tweetFetcher: async () => { throw new Error('No tweet calls required'); }, articleFetcher: async (url) => {
+        if (url.endsWith('/fails')) throw new Error('HTTP 503');
+        return { title: 'Source', text: 'Complete external text with a unique search token ' + url.split('/').pop() + 'urlcanary' };
+      } });
+    assert.equal(result.articlesEnriched, 3); assert.deepEqual(result.pendingIds, ['urls-root']); assert.equal(result.failed, 1);
+    const saved = JSON.parse((await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), 'utf8')).trim());
+    assert.equal(saved.linkedResources.length, 2); assert.ok(saved.quotedTweet.linkedResources[0].content.text.includes('quoteurlcanary'));
+    await buildIndex({ force: true });
+    assert.ok((await searchBookmarks({ query: 'replyurlcanary' })).some((hit) => hit.id === 'urls-root'));
+    assert.ok((await searchBookmarks({ query: 'quoteurlcanary' })).some((hit) => hit.id === 'urls-root'));
+  }, [target]);
+});
+
 test('syncGaps: reports ordinary link-only article misses and persists resolved links', async () => {
   const linkArticle: BookmarkRecord = {
     id: 'external-miss',

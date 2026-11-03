@@ -10,6 +10,19 @@ import {
   resetHttpSafetyForTests,
 } from '../src/http-safety.js';
 
+test('audit snippets bound untrusted response bodies without consuming the original response', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-audit-size-'));
+  const log = path.join(directory, 'audit.jsonl'), previous = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('A'.repeat(20000), { status: 503 })) as typeof fetch;
+  try {
+    configureHttpSafety({ auditHttp: true, auditLogPath: log, minDelayMs: 0 });
+    const response = await controlledFetch('https://example.org/unavailable', {}, { category: 'external' });
+    assert.equal((await response.text()).length, 20000);
+    const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
+    assert.equal(entry.responseSnippet.length, 500); assert.equal(entry.responseSnippetTruncated, true);
+  } finally { globalThis.fetch = previous; resetHttpSafetyForTests(); fs.rmSync(directory, { recursive: true }); }
+});
+
 test('controlledFetch writes redacted HTTP audit entries', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-http-audit-'));
   const logPath = path.join(tmpDir, 'audit.jsonl');
