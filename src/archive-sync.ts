@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { Command } from 'commander';
 import { dataDir, twitterBookmarksCachePath } from './paths.js';
 import { readJsonLines } from './fs.js';
-import { configureHttpSafety, isHttpSafetyStop } from './http-safety.js';
+import { configureHttpSafety, isHttpSafetyStop, serverCooldownUntil } from './http-safety.js';
 import { syncBookmarksGraphQL, syncBookmarkFolders, syncThreads, syncGaps } from './graphql-bookmarks.js';
 import { fetchBookmarkMediaBatch, type MediaFetchEntry } from './bookmark-media.js';
 import { exportReadableBookmarkArchive } from './bookmark-folder-export.js';
@@ -86,20 +86,14 @@ export function availableRequestBudget(entries: AuditEntry[], now: number, runLi
     return age >= 0 && age < 3_600_000;
   });
   for (const entry of entries.filter((entry) => Date.parse(entry.ts) <= now)) {
-    if (entry.status !== 429) continue;
-    const resumeAt = requestResumeAt(entry);
-    if (resumeAt > now) throw new Error(`X requested a cooldown until ${new Date(resumeAt).toISOString()}.`);
+    const resumeAt = serverCooldownUntil(entry.status, new Headers(entry.responseHeaders), Date.parse(entry.ts));
+    if (resumeAt != null && resumeAt > now) throw new Error(`Server requested a cooldown until ${new Date(resumeAt).toISOString()}.`);
   }
   return Math.max(0, Math.min(runLimit, hourlyLimit - recent.length));
 }
 
 function requestResumeAt(entry: AuditEntry): number {
-  const reset = Number(entry.responseHeaders?.['x-rate-limit-reset']);
-  const rawRetry = entry.responseHeaders?.['retry-after'];
-  const seconds = Number(rawRetry);
-  const retry = rawRetry ? (seconds > 0 ? Date.parse(entry.ts) + seconds * 1000 : Date.parse(rawRetry)) : NaN;
-  const known = [reset > 0 ? reset * 1000 : NaN, retry].filter(Number.isFinite);
-  return known.length ? Math.max(...known) : Date.parse(entry.ts) + 900_000;
+  return serverCooldownUntil(429, new Headers(entry.responseHeaders), Date.parse(entry.ts))!;
 }
 
 export function overnightPolicy(entries: AuditEntry[], now: number, previous: { mode?: string; startedAt?: string; paused?: string } = {}) {

@@ -32,6 +32,8 @@ When Joel asks for comments from a folder, use `~/.local/bin/x-bookmark-sync --f
 
 One request controller is shared across the stages. The default run budget is 240 controlled requests, with a 300-request hourly allowance checked against saved audit logs, a remaining-rate floor of 120, and request spacing. These limits reduce load; they cannot guarantee against X restrictions. Do not restart with larger budgets to get around a pause. Exit 2 means partial progress was saved and remaining work is queued for a later sync. Exit 1 means an error needs inspection. Exit 0 means the planned stages completed; still report individual extraction misses.
 
+Server-directed `Retry-After` holds stop the current run immediately, including non-429 responses such as HTTP 503/524. The shared controller latches the stop so downstream retry loops cannot shorten it. Redacted audit headers preserve numeric/date-based holds across restarts; preflight refuses a new run before expiry, even if a later request in an older log succeeded. Do not restart to bypass a cooldown.
+
 Inspect the outputs before reporting success:
 
 - `~/.fieldtheory/bookmarks/previews/latest-fetch-summary.json`: counts, stage results, failures, pending work, HTTP status and network error counts.

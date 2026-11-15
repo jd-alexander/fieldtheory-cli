@@ -28,7 +28,7 @@ export interface HttpSafetyConfig {
 }
 
 type HttpSafetyStopReason = 'request budget reached' | 'hourly request budget reached' | 'rate limit floor reached'
-  | 'scheduled request window ended' | 'X returned HTTP 429' | 'Authentication or access failure';
+  | 'scheduled request window ended' | 'X returned HTTP 429' | 'Authentication or access failure' | 'server cooldown requested';
 
 export class HttpSafetyStopError extends Error {
   constructor(
@@ -193,6 +193,18 @@ function responseRateRemaining(response: Response): number | undefined {
   return Number.isFinite(value) ? value : undefined;
 }
 
+export function serverCooldownUntil(status: number | undefined, headers: Headers, receivedAt: number): number | undefined {
+  const rawRetry = headers.get('retry-after')?.trim();
+  const seconds = rawRetry ? Number(rawRetry) : NaN;
+  const retry = rawRetry
+    ? (Number.isFinite(seconds) ? (seconds >= 0 ? receivedAt + seconds * 1000 : NaN) : Date.parse(rawRetry))
+    : NaN;
+  const reset = status === 429 ? Number(headers.get('x-rate-limit-reset')) * 1000 : NaN;
+  const known = [retry, reset].filter((value) => value > 0 && Number.isFinite(new Date(value).getTime()));
+  if (known.length) return Math.max(...known);
+  return status === 429 ? receivedAt + 900_000 : undefined;
+}
+
 class HttpSafetyController {
   private requestCount = 0;
   private requestTimestamps: number[] = [];
@@ -223,6 +235,7 @@ class HttpSafetyController {
       throw error;
     }
 
+    const cooldownUntil = serverCooldownUntil(response.status, response.headers, Date.now());
     await this.audit({
       metadata,
       method,
@@ -235,6 +248,14 @@ class HttpSafetyController {
     if (this.config.stopOnBlockedResponse && [429, 401, 403].includes(response.status)) {
       this.stopped = new HttpSafetyStopError(`Unattended fetch stopped on HTTP ${response.status}.`,
         response.status === 429 ? 'X returned HTTP 429' : 'Authentication or access failure');
+      throw this.stopped;
+    }
+    // Stop in the shared controller so no caller's retry loop can shorten a server hold.
+    if (cooldownUntil != null && cooldownUntil > Date.now()) {
+      this.stopped = new HttpSafetyStopError(
+        `Server requested a cooldown until ${new Date(cooldownUntil).toISOString()} (HTTP ${response.status}).`,
+        'server cooldown requested',
+      );
       throw this.stopped;
     }
     this.stopIfRateLimitFloorReached(response);

@@ -36,7 +36,7 @@ import {
 } from '../src/graphql-bookmarks.js';
 import { buildIndex, getBookmarkById, searchBookmarks } from '../src/bookmarks-db.js';
 import { resolveFolder, formatFolderMirrorStats } from '../src/cli.js';
-import { HttpSafetyStopError } from '../src/http-safety.js';
+import { HttpSafetyStopError, resetHttpSafetyForTests } from '../src/http-safety.js';
 import type { BookmarkFolder, BookmarkRecord } from '../src/types.js';
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -1258,6 +1258,7 @@ async function withIsolatedGapFillDataDir(
   fn: () => Promise<void>,
   fixtures: BookmarkRecord[],
 ): Promise<void> {
+  resetHttpSafetyForTests();
   const dir = await mkdtemp(path.join(tmpdir(), 'ft-gaps-test-'));
   const jsonl = fixtures.map((r) => JSON.stringify(r)).join('\n') + '\n';
   await writeFile(path.join(dir, 'bookmarks.jsonl'), jsonl);
@@ -1270,6 +1271,7 @@ async function withIsolatedGapFillDataDir(
   try {
     await fn();
   } finally {
+    resetHttpSafetyForTests();
     if (savedDataDir !== undefined) process.env.FT_DATA_DIR = savedDataDir;
     else delete process.env.FT_DATA_DIR;
     if (savedChromeDir !== undefined) process.env.FT_CHROME_USER_DATA_DIR = savedChromeDir;
@@ -2139,14 +2141,13 @@ test('syncBookmarksGraphQL: rate limit stops cleanly and saves cursor for contin
         stalePageLimit: 1,
       });
 
-      assert.equal(fetchCalls, 5);
+      assert.equal(fetchCalls, 2);
       assert.equal(result.pages, 1);
       assert.equal(result.added, 0);
-      assert.equal(result.stopReason, 'rate limited');
-      assert.equal(result.retryAfterSec, 1);
+      assert.equal(result.stopReason, 'server cooldown requested');
 
       const state = JSON.parse(await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks-backfill-state.json'), 'utf8'));
-      assert.equal(state.stopReason, 'rate limited');
+      assert.equal(state.stopReason, 'server cooldown requested');
       assert.equal(state.lastCursor, 'cursor-2');
 
       const meta = JSON.parse(await readFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks-meta.json'), 'utf8'));

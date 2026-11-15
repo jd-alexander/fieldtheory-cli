@@ -71,6 +71,27 @@ test('server cooldowns survive more than one hour and honor the later reset/retr
   ], now, 80, 120), 80);
 });
 
+test('saved non-429 cooldowns block restarts until Retry-After expires, even after a later success', () => {
+  for (const status of [524, 503, 200]) {
+    for (const retry of ['120', new Date(now + 60_000).toUTCString()]) {
+      const entries = [
+        { ts: new Date(now - 60_000).toISOString(), status, responseHeaders: { 'retry-after': retry } },
+        { ts: new Date(now - 10_000).toISOString(), status: 200 },
+      ];
+      assert.throws(() => availableRequestBudget(entries, now, 80, 120), /cooldown/);
+      assert.equal(availableRequestBudget(entries, now + 60_000, 80, 120), 80);
+    }
+  }
+  assert.throws(() => availableRequestBudget([
+    { ts: new Date(now - 7_200_000).toISOString(), status: 524, responseHeaders: { 'retry-after': '10800' } },
+  ], now, 80, 120), /cooldown/);
+  for (const retry of ['0', '-1', 'invalid']) {
+    assert.equal(availableRequestBudget([
+      { ts: new Date(now - 60_000).toISOString(), status: 524, responseHeaders: { 'retry-after': retry } },
+    ], now, 80, 120), 80);
+  }
+});
+
 test('overnight policy enforces Jamaica hours, small budgets and a six-AM deadline', () => {
   const oneAM = Date.parse('2026-10-30T06:00:00Z');
   const policy = overnightPolicy([], oneAM);

@@ -8,7 +8,54 @@ import {
   controlledFetch,
   HttpSafetyStopError,
   resetHttpSafetyForTests,
+  serverCooldownUntil,
 } from '../src/http-safety.js';
+
+test('server cooldown parsing handles non-429 responses, HTTP dates and the later 429 reset', () => {
+  const now = Date.parse('2026-11-15T19:00:00Z');
+  assert.equal(serverCooldownUntil(524, new Headers({ 'retry-after': '120' }), now), now + 120_000);
+  assert.equal(serverCooldownUntil(503, new Headers({ 'retry-after': 'Sun, 15 Nov 2026 19:02:00 GMT' }), now), now + 120_000);
+  assert.equal(serverCooldownUntil(429, new Headers({ 'retry-after': '120', 'x-rate-limit-reset': String((now + 180_000) / 1000) }), now), now + 180_000);
+  assert.equal(serverCooldownUntil(429, new Headers(), now), now + 900_000);
+  assert.equal(serverCooldownUntil(200, new Headers({ 'x-rate-limit-reset': String((now + 180_000) / 1000) }), now), undefined);
+  for (const value of ['invalid', '-1', '1e100']) {
+    assert.equal(serverCooldownUntil(524, new Headers({ 'retry-after': value }), now), undefined);
+  }
+  assert.equal(serverCooldownUntil(524, new Headers({ 'retry-after': '0' }), now), now);
+  assert.equal(serverCooldownUntil(503, new Headers({ 'retry-after': 'Sun, 15 Nov 2026 18:59:00 GMT' }), now), now - 60_000);
+});
+
+test('server-directed cooldowns stop manual and unattended callers before their retry loops', async () => {
+  const originalFetch = globalThis.fetch, originalNow = Date.now;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-server-cooldown-'));
+  let now = Date.parse('2026-11-15T19:00:00Z');
+  Date.now = () => now;
+  try {
+    for (const stopOnBlockedResponse of [false, true]) {
+      for (const status of [524, 503]) {
+        let calls = 0;
+        const log = path.join(directory, `${stopOnBlockedResponse}-${status}.jsonl`);
+        const retryAfter = status === 524 ? '120' : new Date(now + 120_000).toUTCString();
+        globalThis.fetch = (async () => {
+          calls++;
+          return new Response('{}', { status, headers: { 'retry-after': retryAfter } });
+        }) as typeof fetch;
+        configureHttpSafety({ auditHttp: true, auditLogPath: log, minDelayMs: 0, stopOnBlockedResponse });
+        await assert.rejects(() => controlledFetch('https://x.com/test'), (error) =>
+          error instanceof HttpSafetyStopError && error.stopReason === 'server cooldown requested');
+        now += 180_000;
+        await assert.rejects(() => controlledFetch('https://x.com/test'), HttpSafetyStopError);
+        assert.equal(calls, 1, 'the run stays stopped even if the caller catches the error or time advances');
+        const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
+        assert.equal(entry.status, status);
+        assert.equal(entry.responseHeaders['retry-after'], retryAfter);
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch; Date.now = originalNow; resetHttpSafetyForTests();
+    fs.rmSync(directory, { recursive: true });
+  }
+});
 
 test('audit snippets bound untrusted response bodies without consuming the original response', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-audit-size-'));
